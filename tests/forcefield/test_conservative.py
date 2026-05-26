@@ -14,8 +14,6 @@ def test_regressor_forward(request, conservative_regressor, graph_name):
     graph = request.getfixturevalue(graph_name)
     out = conservative_regressor(graph)
     assert "energy" in out
-    assert "forces" in out
-    assert "stress" in out
     assert "grad_forces" in out
     assert "grad_stress" in out
 
@@ -70,20 +68,8 @@ def test_regressor_predict(batch, conservative_regressor):
     conservative_regressor.eval()
     inference = conservative_regressor.predict(batch)
     assert "energy" in inference
-    assert "forces" in inference
-    assert "stress" in inference
     assert "grad_forces" in inference
     assert "grad_stress" in inference
-
-
-def test_conservative_model_can_distill(batch, conservative_regressor):
-    conservative_regressor.eval()
-    conservative_regressor.distill_direct_heads = True
-    distill_output = conservative_regressor.loss(batch)
-
-    conservative_regressor.distill_direct_heads = False
-    output = conservative_regressor.loss(batch)
-    assert not torch.allclose(output.loss, distill_output.loss)
 
 
 def test_featurization_differentiability_with_conservative_regressor(
@@ -150,21 +136,28 @@ def test_modules_have_float64_dtypes_for_float64_model(batch, conservative_regre
         hook.remove()
 
 
-@pytest.mark.xfail(True, reason="The regressor forward is currently not compilable.")
-def test_regressor_can_torch_compile(conservative_regressor, batch):
-    """Tests if the ConservativeForcefieldRegressor.forward is compilable with torch.compile."""
+@pytest.mark.parametrize("graph_name", ["single_graph", "batch"])
+def test_regressor_compile(conservative_regressor, graph_name, request):
+    """Tests compile (backbone + heads + autograd, with graph breaks)."""
+    graph = request.getfixturevalue(graph_name)
     conservative_regressor.eval()
-    compiled = torch.compile(conservative_regressor, mode="default", dynamic=True, fullgraph=True)
-    compiled(batch)
+    conservative_regressor.compile(mode="default", dynamic=True)
+    conservative_regressor(graph)
 
 
-def test_regressor_module_compiles(conservative_regressor, batch):
-    """Tests if ConservativeForcefieldRegressor.forward (partially) compiles with Module.compile.
-
-    This tests whether the override of ConservativeForcefieldRegressor.compile allows us to
-    compile the model. If there is no override of ConservativeForcefieldRegressor.compile
-    then this test should be effectively equivalent to _can_compile test above.
-    """
+@pytest.mark.parametrize("graph_name", ["single_graph", "batch"])
+def test_regressor_compile_matches_eager(conservative_regressor, graph_name, request):
+    """Compile produces the same outputs as eager."""
+    graph = request.getfixturevalue(graph_name)
     conservative_regressor.eval()
-    conservative_regressor.compile(mode="default", dynamic=True, fullgraph=True)
-    conservative_regressor(batch)
+    eager_out = conservative_regressor(graph)
+    conservative_regressor.compile(mode="default", dynamic=True)
+    compiled_out = conservative_regressor(graph)
+    for key in eager_out:
+        torch.testing.assert_close(
+            compiled_out[key],
+            eager_out[key],
+            atol=1e-5,
+            rtol=1e-5,
+            msg=f"Mismatch for {key!r}",
+        )

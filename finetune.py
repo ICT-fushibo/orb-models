@@ -29,6 +29,9 @@ from orb_models.common.training.metrics import ScalarMetricTracker
 from orb_models.common.training.util import get_optim, init_device
 from orb_models.common.utils import seed_everything
 from orb_models.forcefield import pretrained
+from orb_models.forcefield.models.conservative_regressor import (
+    ConservativeForcefieldRegressor,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -439,26 +442,30 @@ def run(args):
     # GPUs and does not appear to hurt training
     precision = "float32-high"
 
-    # Prepare loss weights if specified
-    loss_weights = {}
-    is_conservative_model = "conservative" in args.base_model
+    # Instantiate model with configuration
+    base_model = args.base_model
+    model, atoms_adapter = getattr(pretrained, base_model)(
+        device=device,
+        precision=precision,
+        train=True,
+        train_reference_energies=args.trainable_reference_energies,
+    )
 
+    # Detect conservative vs direct from the instantiated model type.
+    is_conservative_model = isinstance(model, ConservativeForcefieldRegressor)
+
+    # Map CLI loss-weight flags onto the keys the instantiated model expects.
+    loss_weights: dict[str, float] = {}
     if args.energy_loss_weight is not None:
         loss_weights["energy"] = args.energy_loss_weight
 
     if args.forces_loss_weight is not None:
-        # Key depends on model type
-        if is_conservative_model:
-            loss_weights["grad_forces"] = args.forces_loss_weight
-        else:  # direct model
-            loss_weights["forces"] = args.forces_loss_weight
+        key = "grad_forces" if is_conservative_model else "forces"
+        loss_weights[key] = args.forces_loss_weight
 
     if args.stress_loss_weight is not None:
-        # Key depends on model type
-        if is_conservative_model:
-            loss_weights["grad_stress"] = args.stress_loss_weight
-        else:  # direct model
-            loss_weights["stress"] = args.stress_loss_weight
+        key = "grad_stress" if is_conservative_model else "stress"
+        loss_weights[key] = args.stress_loss_weight
 
     if args.equigrad_loss_weight is not None:
         if not is_conservative_model:
@@ -471,16 +478,7 @@ def run(args):
         for key, val in loss_weights.items():
             logging.info(f"  {key}: {val}")
         logging.info("=" * 60)
-
-    # Instantiate model with configuration
-    base_model = args.base_model
-    model, atoms_adapter = getattr(pretrained, base_model)(
-        device=device,
-        precision=precision,
-        train=True,
-        train_reference_energies=args.trainable_reference_energies,
-        loss_weights=loss_weights if loss_weights else None,
-    )
+        model.loss_weights.update(loss_weights)
 
     # Handle custom reference energies if provided
     if args.custom_reference_energies:
@@ -678,12 +676,15 @@ def main():
         type=str,
         help="Base model to finetune.",
         choices=[
+            "orbmol_v2",
+            "orb_v3_conservative_omol",
+            "orb_v3_direct_omol",
+            "orbmol_v1_conservative",
+            "orbmol_v1_direct",
             "orb_v3_conservative_inf_omat",
             "orb_v3_conservative_20_omat",
             "orb_v3_direct_inf_omat",
             "orb_v3_direct_20_omat",
-            "orb_v3_conservative_omol",
-            "orb_v3_direct_omol",
             "orb_v2",
         ],
     )

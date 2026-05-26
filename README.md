@@ -21,11 +21,19 @@ Alternatively, you can use Docker to run orb-models; [see instructions below](#d
 
 ### Updates
 
+**May 2026**: Release of OrbMol-v2 — adds a `CoulombModule` for long-range electrostatics on top of the OrbMol architecture, using direct Coulomb summation for non-periodic systems and Particle Mesh Ewald (via `nvalchemiops`) for periodic. Trained on OMol25 and OPoly26 (ωB97M-V/def2-TZVPD); load with `pretrained.orbmol_v2(device="cuda")`. See [MODELS.md](MODELS.md) for the full architecture description.
+
+* **Long-range electrostatics and learnable charges.** GSCDB138 Normalized Error Ratio drops from **6.05 → 1.62** (3.7× lower, comparable to a good DFT functional).
+* **Full-model compilation.** `model.compile(...)` now wraps the full regressor for all models, giving ~1.7× speedup at 10k atoms on a single 80 GB GPU.
+
+`model.predict(...)["energy"]` now returns **fp64** by default to preserve kJ/mol resolution against OMol-scale references (~1e4–1e5 eV). Pass `fp64_energy=False` to opt out.
+
 **February 2026**: Improved GPU-accelerated graph construction with [ALCHEMI Toolkit-Ops](https://github.com/NVIDIA/nvalchemi-toolkit-ops) and batched simulation with [TorchSim](https://github.com/TorchSim/torch-sim):
 
 * Alchemi-based graph construction (GPU-accelerated, up to 12x faster for large single systems, and sub-linear batch scaling delivering >100x graph construction speed-up for large batches of small systems)
 * TorchSim wrapper for batched optimisation and simulation, see [usage with TorchSim](#usage-with-torchsim)
 * Alchemi-based D3 dispersion correction module, see [D3 correction](#d3-correction)
+
 
 **August 2025**: Release of the [OrbMol potentials](https://www.orbitalindustries.com/posts/orbmol-extending-orb-to-molecular-systems):
 
@@ -189,7 +197,7 @@ from ase.build import molecule
 from orb_models.forcefield import pretrained
 
 device = "cpu"  # or device="cuda"
-orbff, atoms_adapter = pretrained.orb_v3_conservative_omol(
+orbff, atoms_adapter = pretrained.orbmol_v2(
   device=device,
   precision="float32-high",   # or "float32-highest" / "float64
 )
