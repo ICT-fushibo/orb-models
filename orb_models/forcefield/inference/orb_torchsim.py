@@ -26,8 +26,10 @@ class OrbTorchSimModel(ModelInterface):
         atoms_adapter: ForcefieldAtomsAdapter,
         *,
         edge_method: EdgeCreationMethod | None = None,
+        max_num_neighbors: int | None = None,
         device: torch.device | str | None = None,
         dtype: torch.dtype = torch.float32,
+        graph_construction_dtype: torch.dtype | None = None,
     ) -> None:
         """Initialize OrbTorchSimModel interface to Orb models.
 
@@ -35,8 +37,11 @@ class OrbTorchSimModel(ModelInterface):
             model (DirectForcefieldRegressor | ConservativeForcefieldRegressor | D3SumModel): The Orb model to use for predictions.
             atoms_adapter (ForcefieldAtomsAdapter): The adapter to convert between TorchSim SimState and AtomGraphs.
             edge_method (EdgeCreationMethod, optional): The method to use for graph edge construction. Defaults to knn_alchemi.
+            max_num_neighbors: Optional override for the adapter's neighbor cap.
             device (torch.device or str, optional): Device to run the model on
             dtype (torch.dtype, optional): Data type for computation
+            graph_construction_dtype: Floating point dtype used while constructing
+                the neighbor graph. Defaults to TorchSim's state/default dtype.
         """
         super().__init__()
         device = torch.device(device) if device is not None else None
@@ -45,6 +50,8 @@ class OrbTorchSimModel(ModelInterface):
 
         self.atoms_adapter = atoms_adapter
         self.edge_method = edge_method
+        self.max_num_neighbors = max_num_neighbors
+        self.graph_construction_dtype = graph_construction_dtype
 
         self.model = model.to(self._device)  # type: ignore
         self.model = self.model.eval()
@@ -76,9 +83,11 @@ class OrbTorchSimModel(ModelInterface):
 
         batch = self.atoms_adapter.from_torchsim_state(
             state,
+            max_num_neighbors=self.max_num_neighbors,
             edge_method=self.edge_method,
             device=self.device,
             output_dtype=self._dtype,
+            graph_construction_dtype=self.graph_construction_dtype,
         )
         predictions = self.model.predict(batch)
         results = self._get_results(predictions)
