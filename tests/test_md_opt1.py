@@ -118,6 +118,20 @@ def test_opt1_rejects_cpu_neighbor_builder():
         _validate_request(request)
 
 
+def test_opt1_validates_periodic_cell_before_gpu_model_loading():
+    request = MDRunRequest(
+        model="orbv3",
+        stage="opt1",
+        model_path="orb-v3-conservative-inf-mpa-20250404.ckpt",
+        atoms=Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.7]], pbc=True),
+        config=MDConfig(device="cuda:0", dtype="float64", steps=1, observation_steps=(1,)),
+        backend="gpu-resident",
+        options={"model_variant": "orb-v3-conservative-inf-mpa"},
+    )
+    with pytest.raises(ValueError, match="cell.*zeros"):
+        _validate_request(request)
+
+
 def test_matbench_snapshot_contains_initial_step_and_stress():
     atoms = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.7]], cell=[5, 5, 5], pbc=True)
     state = GPUMDState(

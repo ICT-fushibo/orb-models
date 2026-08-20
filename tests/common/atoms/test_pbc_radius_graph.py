@@ -17,6 +17,83 @@ from tests.common.atoms.conftest import (
 )
 
 
+def test_static_alchemi_hot_path_does_not_read_cuda_scalars(monkeypatch):
+    """The calibrated single-system MD path must not call Tensor.item()."""
+
+    positions = torch.zeros((2, 3))
+    cells = torch.eye(3).unsqueeze(0)
+    pbcs = torch.ones((1, 3), dtype=torch.bool)
+    n_node = torch.tensor([2])
+    node_batch_index = torch.zeros(2, dtype=torch.long)
+    max_number_neighbors = torch.tensor([120])
+    state = graph_featurization.AlchemiNeighborListState(max_neighbors=320)
+
+    def fake_neighbor_list(**kwargs):
+        assert kwargs["max_neighbors"] == 320
+        return (
+            torch.tensor([[1], [0]]),
+            torch.ones(2, dtype=torch.long),
+            torch.zeros((2, 1, 3), dtype=torch.long),
+        )
+
+    monkeypatch.setattr(graph_featurization, "nva_neighbor_list", fake_neighbor_list)
+    original_item = torch.Tensor.item
+    monkeypatch.setattr(
+        torch.Tensor,
+        "item",
+        lambda self: (_ for _ in ()).throw(AssertionError("hot-path Tensor.item()")),
+    )
+
+    edges, vectors, unit_shifts, n_edges = (
+        graph_featurization.batch_compute_pbc_radius_graph(
+            positions=positions,
+            cells=cells,
+            pbcs=pbcs,
+            radius=6.0,
+            n_node=n_node,
+            node_batch_index=node_batch_index,
+            max_number_neighbors=max_number_neighbors,
+            edge_method="knn_alchemi",
+            device="cpu",
+            static_max_number_neighbors=120,
+            alchemi_neighbor_state=state,
+            validate_pbc_cell=False,
+        )
+    )
+    monkeypatch.setattr(torch.Tensor, "item", original_item)
+
+    assert edges.shape == (2, 2)
+    assert vectors.shape == (2, 3)
+    assert unit_shifts.shape == (2, 3)
+    torch.testing.assert_close(n_edges, torch.tensor([2]))
+
+
+def test_static_alchemi_capacity_fails_instead_of_silently_truncating(monkeypatch):
+    state = graph_featurization.AlchemiNeighborListState(max_neighbors=2)
+
+    def overflowing_neighbor_list(**kwargs):
+        return (
+            torch.full((2, 2), -1, dtype=torch.long),
+            torch.tensor([3, 1]),
+            torch.zeros((2, 2, 3), dtype=torch.long),
+        )
+
+    monkeypatch.setattr(
+        graph_featurization,
+        "nva_neighbor_list",
+        overflowing_neighbor_list,
+    )
+    with pytest.raises(RuntimeError):
+        graph_featurization._compute_neighbor_list_with_fallback(
+            positions=torch.zeros((2, 3)),
+            cell=torch.eye(3),
+            pbc=torch.ones(3, dtype=torch.bool),
+            cutoff=6.0,
+            fill_value=-1,
+            state=state,
+        )
+
+
 def _matrix_to_set_of_vectors(matrix):
     ndarray_to_tuple = lambda x: tuple(map(tuple, x))
     return set([ndarray_to_tuple(x) for x in np.split(matrix, len(matrix))])

@@ -1,6 +1,7 @@
 import gc
 import typing
 import warnings
+from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
@@ -61,6 +62,47 @@ HALF_OFFSETS = np.array(
         [0.0, 0.0, 1.0],
     ]
 )
+
+
+@dataclass
+class AlchemiNeighborListState:
+    """Cache the Alchemi matrix capacity after a one-time calibration.
+
+    The regular neighbor-list API probes for overflow on every call. That is a
+    useful general-purpose safeguard, but reading ``num_neighbors.max()`` back
+    to Python synchronizes CUDA. A fixed-cell MD trajectory can calibrate once
+    before timing and reuse the selected capacity in its hot loop.
+    """
+
+    max_neighbors: int | None = None
+
+
+def _get_neighbor_list_from_neighbor_matrix_unchecked(
+    neighbor_matrix: torch.Tensor,
+    num_neighbors: torch.Tensor,
+    neighbor_shift_matrix: torch.Tensor,
+    *,
+    fill_value: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Convert a calibrated matrix to COO without a host-side overflow check.
+
+    The caller must enqueue a device-side capacity assertion first. The
+    upstream utility performs ``if max_found > width`` in Python, which reads a
+    CUDA scalar back to the host on every MD step.
+    """
+
+    mask = neighbor_matrix != fill_value
+    dtype = neighbor_matrix.dtype
+    senders = torch.where(mask)[0].to(dtype)
+    receivers = neighbor_matrix[mask].to(dtype)
+    neighbor_list = torch.stack((senders, receivers), dim=0)
+    neighbor_ptr = torch.zeros(
+        num_neighbors.shape[0] + 1,
+        dtype=torch.int32,
+        device=neighbor_matrix.device,
+    )
+    torch.cumsum(num_neighbors, dim=0, out=neighbor_ptr[1:])
+    return neighbor_list, neighbor_ptr, neighbor_shift_matrix[mask]
 
 
 def _integer_lattice(
@@ -492,6 +534,7 @@ def select_k_neighbors_from_alchemi_neighbor_matrix(
     *,
     max_number_neighbors: int,
     fill_value: int = -1,
+    truncate_to_observed: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Select the top k neighbors from the alchemi neighbor matrix.
 
@@ -504,10 +547,13 @@ def select_k_neighbors_from_alchemi_neighbor_matrix(
         max_number_neighbors (int): The maximum number of neighbors for each atom.
         fill_value (int): The fill value to use for invalid entries. Defaults to -1.
     """
-    # Truncate the neighbor matrix to save computation/memory
-    max_num_neighbors_alchemi = num_neighbors.max()
-    neighbor_matrix = neighbor_matrix[:, :max_num_neighbors_alchemi]
-    neighbor_shift_matrix = neighbor_shift_matrix[:, :max_num_neighbors_alchemi, :]
+    if truncate_to_observed:
+        # The general-purpose path minimizes work at the cost of converting a
+        # CUDA scalar into a slice bound. Fixed-capacity MD keeps this disabled
+        # so no host synchronization occurs in the hot loop.
+        max_num_neighbors_alchemi = num_neighbors.max()
+        neighbor_matrix = neighbor_matrix[:, :max_num_neighbors_alchemi]
+        neighbor_shift_matrix = neighbor_shift_matrix[:, :max_num_neighbors_alchemi, :]
 
     valid_mask = neighbor_matrix != fill_value
     # Make all indices valid, so that we can compute distances
@@ -698,6 +744,7 @@ def _setup_neighborlist(
     float_dtype: torch.dtype,
     edge_method: EdgeCreationMethod | None = None,
     device: torch.device | str | int | None = None,
+    validate_pbc_cell: bool = True,
 ):
     """Set up basic arguments and checks for neighbor list computation."""
     is_periodic = torch.any(pbcs, dim=-1)
@@ -706,7 +753,7 @@ def _setup_neighborlist(
     assert edge_method in typing.get_args(EdgeCreationMethod)
     if float_dtype not in TORCH_FLOAT_DTYPES:
         raise ValueError(f"float_dtype must be one of {TORCH_FLOAT_DTYPES}, got {float_dtype}")
-    if bool(
+    if validate_pbc_cell and bool(
         torch.logical_and(is_periodic, torch.all(cells.reshape(-1, 9) == 0.0, dim=-1)).any().item()
     ):
         raise ValueError("'pbc' is True, but 'cell' is all zeros!")
@@ -726,6 +773,7 @@ def _compute_neighbor_list_with_fallback(
     fallback_atomic_density: float = 0.35 * 5,
     fill_value: int | None = None,
     wrap_positions: bool = False,
+    state: AlchemiNeighborListState | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute neighbor list with automatic fallback if initial estimate is too low.
 
@@ -742,6 +790,24 @@ def _compute_neighbor_list_with_fallback(
     n_systems = cell.shape[0] if cell.dim() == 3 else 1
     pbc = pbc.view(-1, 3).expand(n_systems, 3).contiguous()
 
+    if state is not None and state.max_neighbors is not None:
+        neighbor_matrix, num_neighbors, neighbor_shift_matrix = nva_neighbor_list(
+            positions=positions,
+            cell=cell,
+            pbc=pbc,
+            cutoff=cutoff,
+            batch_idx=batch_idx,
+            batch_ptr=batch_ptr,
+            fill_value=fill_value,
+            max_neighbors=state.max_neighbors,
+            wrap_positions=wrap_positions,
+        )
+        # Keep the overflow check on device. Unlike Tensor.item(), this does
+        # not synchronize CUDA; a later launch reports the failed assertion
+        # instead of silently accepting a truncated neighbor matrix.
+        torch._assert_async(num_neighbors.max() <= state.max_neighbors)
+        return neighbor_matrix, num_neighbors, neighbor_shift_matrix
+
     for atomic_density in [initial_atomic_density, fallback_atomic_density]:
         max_num_neighbors_alchemi = estimate_max_neighbors(cutoff, atomic_density=atomic_density)
         neighbor_matrix, num_neighbors, neighbor_shift_matrix = nva_neighbor_list(
@@ -755,7 +821,12 @@ def _compute_neighbor_list_with_fallback(
             max_neighbors=max_num_neighbors_alchemi,
             wrap_positions=wrap_positions,
         )
-        if max_num_neighbors_alchemi >= num_neighbors.max().item():
+        observed_max = int(num_neighbors.max().item())
+        # Reserve 25% headroom for an NVT trajectory. If the initial estimate
+        # is close to capacity, calibrate with the conservative fallback.
+        if max_num_neighbors_alchemi >= max(1, int(np.ceil(observed_max * 1.25))):
+            if state is not None:
+                state.max_neighbors = max_num_neighbors_alchemi
             return neighbor_matrix, num_neighbors, neighbor_shift_matrix
 
     raise RuntimeError(
@@ -777,6 +848,9 @@ def batch_compute_pbc_radius_graph(
     half_supercell: bool | None = None,
     device: torch.device | str | int | None = None,
     float_dtype: torch.dtype = torch.float32,
+    static_max_number_neighbors: int | None = None,
+    alchemi_neighbor_state: AlchemiNeighborListState | None = None,
+    validate_pbc_cell: bool = True,
 ):
     """Computes edges within a max radius and num_neighbors, accounting for periodic-boundary conditions.
 
@@ -811,13 +885,17 @@ def batch_compute_pbc_radius_graph(
         float_dtype=float_dtype,
         edge_method=edge_method,
         device=device,
+        validate_pbc_cell=validate_pbc_cell,
     )
 
     if edge_method == "knn_alchemi":
-        assert (max_number_neighbors == max_number_neighbors[0]).all(), (
-            f"max_number_neighbors must be the same for all atoms, got {max_number_neighbors}"
-        )
-        max_number_neighbors = max_number_neighbors[0]
+        if static_max_number_neighbors is None:
+            assert (max_number_neighbors == max_number_neighbors[0]).all(), (
+                f"max_number_neighbors must be the same for all atoms, got {max_number_neighbors}"
+            )
+            max_number_neighbors_value = int(max_number_neighbors[0].item())
+        else:
+            max_number_neighbors_value = int(static_max_number_neighbors)
         positions = positions.to(dtype=float_dtype, device=device)
         cells = cells.to(dtype=float_dtype, device=device)
         cells_batched = cells[node_batch_index]
@@ -835,9 +913,10 @@ def batch_compute_pbc_radius_graph(
                 cutoff=float(radius),
                 batch_ptr=ptr,
                 fill_value=-1,
+                state=alchemi_neighbor_state,
             )
         )
-        if max_number_neighbors.item() != -1:
+        if max_number_neighbors_value != -1:
             # Select k nearest neighbors
             neighbor_matrix, num_neighbors, neighbor_shift_matrix = (
                 select_k_neighbors_from_alchemi_neighbor_matrix(
@@ -846,17 +925,28 @@ def batch_compute_pbc_radius_graph(
                     neighbor_matrix=neighbor_matrix,
                     num_neighbors=num_neighbors,
                     neighbor_shift_matrix=neighbor_shift_matrix,
-                    max_number_neighbors=int(max_number_neighbors.item()),
+                    max_number_neighbors=max_number_neighbors_value,
                     fill_value=-1,
+                    truncate_to_observed=alchemi_neighbor_state is None,
                 )
             )
         # Convert the neighbor matrix [num_atoms, max_num_neighbors] to a neighbor list.
-        edges, neighbor_ptr, unit_shifts = get_neighbor_list_from_neighbor_matrix(
-            neighbor_matrix,
-            num_neighbors=num_neighbors,
-            neighbor_shift_matrix=neighbor_shift_matrix,
-            fill_value=-1,
-        )
+        if alchemi_neighbor_state is None:
+            edges, neighbor_ptr, unit_shifts = get_neighbor_list_from_neighbor_matrix(
+                neighbor_matrix,
+                num_neighbors=num_neighbors,
+                neighbor_shift_matrix=neighbor_shift_matrix,
+                fill_value=-1,
+            )
+        else:
+            edges, neighbor_ptr, unit_shifts = (
+                _get_neighbor_list_from_neighbor_matrix_unchecked(
+                    neighbor_matrix,
+                    num_neighbors,
+                    neighbor_shift_matrix,
+                    fill_value=-1,
+                )
+            )
         num_neighbors = neighbor_ptr[1:] - neighbor_ptr[:-1]
         cartesian_shifts = torch.einsum(
             "ni,nij->nj",

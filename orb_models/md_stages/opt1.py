@@ -91,6 +91,7 @@ class OrbTorchSimEvaluator:
         variant: str,
         device: torch.device,
         max_num_neighbors: int | None,
+        compute_stress: bool,
     ) -> None:
         try:
             import torch_sim as ts
@@ -118,12 +119,17 @@ class OrbTorchSimEvaluator:
             device=device,
             dtype=torch.float32,
             graph_construction_dtype=torch.float32,
+            static_alchemi_neighbor_list=True,
         )
         self.model.eval()
         self.sim_state = ts.io.atoms_to_state([atoms], device, dtype=torch.float64)
         self.device = device
         self.num_atoms = len(atoms)
         self.max_num_neighbors = max_num_neighbors or adapter.max_num_neighbors
+        self.compute_stress = compute_stress
+        # The one allowed calibration sync happens before warmup/timing. All
+        # subsequent neighbor builds reuse the fixed Alchemi matrix capacity.
+        self.model.prepare_neighbor_list(self.sim_state)
 
     def __call__(self, positions: Tensor) -> tuple[Tensor, Tensor, Tensor | None]:
         if positions.device != self.device or positions.dtype != torch.float64:
@@ -135,8 +141,12 @@ class OrbTorchSimEvaluator:
             )
         # Persistent state object; the only precision conversion is CUDA FP64 MD
         # positions to FP32 AtomGraphs/model inputs inside OrbTorchSimModel.
-        self.sim_state.positions.copy_(positions)
-        outputs = self.model(self.sim_state)
+        self.sim_state.positions = positions
+        outputs = self.model(
+            self.sim_state,
+            compute_forces=True,
+            compute_stress=self.compute_stress,
+        )
         if "energy" not in outputs or "forces" not in outputs:
             raise RuntimeError(f"ORB model omitted energy/forces: {sorted(outputs)}")
         forces = outputs["forces"].reshape(self.num_atoms, 3).to(torch.float64)
@@ -386,6 +396,8 @@ def _validate_request(request: MDRunRequest) -> tuple[str, int | None]:
         raise ValueError("ORBv3 Opt1 requires --dtype float64 for the MD state")
     if request.atoms.constraints:
         raise NotImplementedError("ORBv3 Opt1 does not silently ignore ASE constraints")
+    if np.any(request.atoms.pbc) and not np.any(np.asarray(request.atoms.cell)):
+        raise ValueError("'pbc' is True, but 'cell' is all zeros")
     if len(request.atoms) < 2:
         raise ValueError("NVT MD requires at least two atoms")
 
@@ -456,6 +468,7 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         variant=variant,
         device=device,
         max_num_neighbors=max_num_neighbors,
+        compute_stress=config.collect_trajectory,
     )
     integrator = _build_integrator(request, masses)
 
@@ -561,6 +574,12 @@ def run_md(request: MDRunRequest) -> MDRunResult:
             "warmup_steps": config.warmup_steps,
             "trajectory_initial_frame": bool(config.collect_trajectory),
             "trajectory_stress": bool(config.collect_trajectory),
+            "model_compute_stress": evaluator.compute_stress,
+            "alchemi_matrix_capacity": (
+                None
+                if evaluator.model.alchemi_neighbor_state is None
+                else evaluator.model.alchemi_neighbor_state.max_neighbors
+            ),
         },
     )
     validate_result(request, result)

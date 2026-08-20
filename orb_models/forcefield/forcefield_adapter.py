@@ -374,6 +374,8 @@ class ForcefieldAtomsAdapter(AbstractAtomsAdapter):
         device: torch.device | str | None = None,
         output_dtype: torch.dtype | None = None,
         graph_construction_dtype: torch.dtype | None = None,
+        alchemi_neighbor_state: graph_feat.AlchemiNeighborListState | None = None,
+        validate_pbc_cell: bool = True,
     ) -> AtomGraphs:
         """Convert a SimState object into AtomGraphs format, ready for use in an ORB model.
 
@@ -434,12 +436,15 @@ class ForcefieldAtomsAdapter(AbstractAtomsAdapter):
             positions=positions.contiguous(),
             cells=cell,
             pbcs=pbc,
-            radius=torch.tensor([self.radius], device=device),
+            radius=self.radius,
             max_number_neighbors=max_num_neighbors_tensor,
             n_node=n_node,
             node_batch_index=node_batch_index,
             edge_method=edge_method,
             device=device,
+            static_max_number_neighbors=max_num_neighbors,
+            alchemi_neighbor_state=alchemi_neighbor_state,
+            validate_pbc_cell=validate_pbc_cell,
         )
         senders = edge_index[0].long()
         receivers = edge_index[1].long()

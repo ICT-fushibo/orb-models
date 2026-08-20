@@ -88,3 +88,26 @@ def test_direct_stress_enabled(direct_regressor, mptraj_10_systems_db):
     results = sim_model(sim_state)
     assert "stress" in results
     assert "forces" in results
+
+
+def test_forward_passes_requested_force_and_stress_flags(
+    monkeypatch, conservative_regressor, mptraj_10_systems_db
+):
+    atoms_list = [mptraj_10_systems_db.get_atoms(1)]
+    adapter = ForcefieldAtomsAdapter(6.0, 120)
+    sim_state = ts.io.atoms_to_state(atoms_list, "cpu", torch.get_default_dtype())
+    sim_model = OrbTorchSimModel(conservative_regressor, adapter, edge_method="knn_alchemi")
+    original_predict = conservative_regressor.predict
+    received = {}
+
+    def predict_spy(batch, **kwargs):
+        received.update(kwargs)
+        return original_predict(batch, **kwargs)
+
+    monkeypatch.setattr(conservative_regressor, "predict", predict_spy)
+    results = sim_model(sim_state, compute_forces=True, compute_stress=False)
+
+    assert received["compute_forces"] is True
+    assert received["compute_stress"] is False
+    assert "forces" in results
+    assert "stress" not in results
