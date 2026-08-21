@@ -28,6 +28,10 @@ from md_benchmark.md_route import (
     MDRunResult,
     validate_result,
 )
+from md_benchmark.performance import (
+    CudaPhaseProfiler,
+    performance_profile_requested,
+)
 
 from orb_models.md_route import (
     _DEFAULT_MODEL_VARIANT,
@@ -92,6 +96,7 @@ class OrbTorchSimEvaluator:
         device: torch.device,
         max_num_neighbors: int | None,
         compute_stress: bool,
+        profiler: CudaPhaseProfiler | None = None,
     ) -> None:
         try:
             import torch_sim as ts
@@ -127,6 +132,12 @@ class OrbTorchSimEvaluator:
         self.num_atoms = len(atoms)
         self.max_num_neighbors = max_num_neighbors or adapter.max_num_neighbors
         self.compute_stress = compute_stress
+        self.profiler = profiler or CudaPhaseProfiler(
+            enabled=False,
+            device=device,
+        )
+        if self.profiler.enabled:
+            self.model._md_opt_profiler = self.profiler
         # The one allowed calibration sync happens before warmup/timing. All
         # subsequent neighbor builds reuse the fixed Alchemi matrix capacity.
         self.model.prepare_neighbor_list(self.sim_state)
@@ -141,12 +152,14 @@ class OrbTorchSimEvaluator:
             )
         # Persistent state object; the only precision conversion is CUDA FP64 MD
         # positions to FP32 AtomGraphs/model inputs inside OrbTorchSimModel.
-        self.sim_state.positions = positions
-        outputs = self.model(
-            self.sim_state,
-            compute_forces=True,
-            compute_stress=self.compute_stress,
-        )
+        with self.profiler.phase("model_input"):
+            self.sim_state.positions = positions
+        with self.profiler.phase("calculator_force"):
+            outputs = self.model(
+                self.sim_state,
+                compute_forces=True,
+                compute_stress=self.compute_stress,
+            )
         if "energy" not in outputs or "forces" not in outputs:
             raise RuntimeError(f"ORB model omitted energy/forces: {sorted(outputs)}")
         forces = outputs["forces"].reshape(self.num_atoms, 3).to(torch.float64)
@@ -462,6 +475,10 @@ def run_md(request: MDRunRequest) -> MDRunResult:
     ).clone()
     state = GPUMDState(positions=positions, momenta=momenta)
     initial_state = state.clone()
+    profiler = CudaPhaseProfiler(
+        enabled=performance_profile_requested(request.options),
+        device=device,
+    )
     evaluator = OrbTorchSimEvaluator(
         atoms,
         request.model_path,
@@ -469,6 +486,7 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         device=device,
         max_num_neighbors=max_num_neighbors,
         compute_stress=config.collect_trajectory,
+        profiler=profiler,
     )
     integrator = _build_integrator(request, masses)
 
@@ -510,20 +528,24 @@ def run_md(request: MDRunRequest) -> MDRunResult:
     observations: list[MDObservation] = []
     torch.cuda.reset_peak_memory_stats(device)
     torch.cuda.synchronize(device)
+    profiler.start()
     started = time.perf_counter()
 
     # Matbench requires the initial frame and every record_interval frame.
-    if config.collect_trajectory:
+    with profiler.phase("initial_force"):
         _ensure_evaluated(state, evaluator)
+    if config.collect_trajectory:
         write_frame(0)
     for step in range(1, config.steps + 1):
-        integrator.step(state, evaluator)
+        with profiler.phase("md_step"):
+            integrator.step(state, evaluator)
         if config.collect_statistics and step in observation_steps:
             observations.append(_record_observation(state, step, masses))
         if config.collect_trajectory and step % config.record_interval == 0:
             write_frame(step)
 
     torch.cuda.synchronize(device)
+    profiler.stop()
     elapsed = time.perf_counter() - started
     peak_memory_gb = torch.cuda.max_memory_allocated(device) / 1.0e9
     _validate_final_state(state)
@@ -580,6 +602,7 @@ def run_md(request: MDRunRequest) -> MDRunResult:
                 if evaluator.model.alchemi_neighbor_state is None
                 else evaluator.model.alchemi_neighbor_state.max_neighbors
             ),
+            "performance_profile": profiler.summary(synchronize=False),
         },
     )
     validate_result(request, result)

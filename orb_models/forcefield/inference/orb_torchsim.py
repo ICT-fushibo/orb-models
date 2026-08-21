@@ -115,13 +115,26 @@ class OrbTorchSimModel(ModelInterface):
 
         compute_forces = bool(kwargs.pop("compute_forces", self._compute_forces))
         compute_stress = bool(kwargs.pop("compute_stress", self._compute_stress))
-        batch = self._make_batch(state)
-        predictions = self.model.predict(
-            batch,
-            compute_forces=compute_forces,
-            compute_stress=compute_stress,
-        )
-        results = self._get_results(predictions)
+        profiler = getattr(self, "_md_opt_profiler", None)
+        if profiler is None:
+            batch = self._make_batch(state)
+            predictions = self.model.predict(
+                batch,
+                compute_forces=compute_forces,
+                compute_stress=compute_stress,
+            )
+            results = self._get_results(predictions)
+        else:
+            with profiler.phase("neighbor_list"):
+                batch = self._make_batch(state)
+            with profiler.phase("model_energy_force"):
+                predictions = self.model.predict(
+                    batch,
+                    compute_forces=compute_forces,
+                    compute_stress=compute_stress,
+                )
+            with profiler.phase("result_postprocess"):
+                results = self._get_results(predictions)
 
         if not compute_forces:
             results.pop("forces", None)
