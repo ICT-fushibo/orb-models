@@ -32,6 +32,19 @@ def aggregate_nodes(
 
     device = tensor.device
     count = len(n_node)
+    # Model-only CUDA Graph MD captures one physical system.  Avoid building a
+    # dynamic segment-index tensor for that common case: repeat_interleave on a
+    # CUDA tensor is not stream-capture safe, while the direct reductions are
+    # mathematically identical for one graph and have static output shapes.
+    if count == 1:
+        if reduction == "sum":
+            return tensor.sum(dim=0, keepdim=True)
+        elif reduction == "mean":
+            return tensor.mean(dim=0, keepdim=True)
+        elif reduction == "max":
+            return tensor.amax(dim=0, keepdim=True)
+        else:
+            raise ValueError("Invalid reduction argument. Use sum, mean or max.")
     if deterministic:
         import os
 

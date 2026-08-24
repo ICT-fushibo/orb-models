@@ -11,6 +11,7 @@ from md_benchmark.md_route import MDConfig, MDRunRequest
 from torch import nn
 
 from orb_models import md_route
+from orb_models.common.models import segment_ops
 from orb_models.md_stages.opt2 import (
     CUDAGraphCapacityError,
     ModelOnlyCUDAGraphEvaluator,
@@ -83,6 +84,25 @@ def test_opt2_rejects_extra_acceleration_options(option):
 def test_edge_capacity_has_headroom_and_alignment():
     assert edge_capacity_from_probe(128, margin=0.25, edge_step=128) == 256
     assert edge_capacity_from_probe(100, margin=0.0, edge_step=16) == 112
+
+
+@pytest.mark.parametrize("reduction", ["sum", "mean", "max"])
+def test_single_graph_aggregation_avoids_dynamic_segment_construction(
+    monkeypatch, reduction
+):
+    monkeypatch.setattr(
+        torch,
+        "arange",
+        lambda *_args, **_kwargs: pytest.fail("singleton path called torch.arange"),
+    )
+    values = torch.tensor([[1.0, 4.0], [3.0, 2.0]])
+    actual = segment_ops.aggregate_nodes(
+        values, torch.tensor([2]), reduction=reduction
+    )
+    expected = getattr(values, "amax" if reduction == "max" else reduction)(
+        dim=0, keepdim=True
+    )
+    torch.testing.assert_close(actual, expected)
 
 
 def test_staticize_uses_fixed_buffers_and_dummy_padding():
