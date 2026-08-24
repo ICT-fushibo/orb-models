@@ -18,10 +18,10 @@ from typing import Any
 import numpy as np
 import torch
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
-from torch import nn
-
 from md_benchmark.md_route import MDRunRequest, MDRunResult, validate_result
 from md_benchmark.performance import CudaPhaseProfiler, performance_profile_requested
+from torch import nn
+
 from orb_models.common.atoms import featurization as atom_feat
 from orb_models.common.atoms import graph_featurization as graph_feat
 from orb_models.common.atoms.batch.graph_batch import AtomGraphs

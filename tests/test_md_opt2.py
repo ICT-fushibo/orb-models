@@ -7,9 +7,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 from ase import Atoms
+from md_benchmark.md_route import MDConfig, MDRunRequest
 from torch import nn
 
-from md_benchmark.md_route import MDConfig, MDRunRequest
 from orb_models import md_route
 from orb_models.md_stages.opt2 import (
     CUDAGraphCapacityError,
@@ -194,6 +194,8 @@ def test_production_replay_never_recaptures_or_falls_back():
         torch.zeros(2, 3),
     )
     evaluator._staticize = lambda *_args: 2
+    evaluator._input_addresses = lambda: (("positions", 11), ("senders", 12))
+    evaluator._capture_input_addresses = (("positions", 11), ("senders", 12))
 
     forces, energy, stress = evaluator(torch.zeros(2, 3, dtype=torch.float64))
     assert evaluator.cuda_graph.replays == 1
