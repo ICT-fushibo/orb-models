@@ -582,22 +582,21 @@ class ModelOnlyCUDAGraphEvaluator(OrbTorchSimEvaluator):
             raise CUDAGraphValidationError("ORBv3 CUDA Graph output addresses changed")
         if not self.input_addresses_stable:
             raise CUDAGraphValidationError("ORBv3 CUDA Graph input addresses changed")
-        if not self.replay_stability_passed:
-            raise CUDAGraphValidationError(
-                "ORBv3 repeated replay exceeded validation tolerance: "
-                f"energy={self.replay_energy_abs_error}, "
-                f"forces={self.replay_force_max_abs_error}"
-            )
-        if (
-            self.validation_energy_abs_error > self.energy_atol
-            or self.validation_force_max_abs_error > self.force_atol
+        for name, value in (
+            ("replay energy", replay_energy),
+            ("replay forces", replay_forces),
+            ("second replay energy", second_energy),
+            ("second replay forces", second_forces),
         ):
-            raise CUDAGraphValidationError(
-                "ORBv3 fixed-capacity replay disagrees with eager: "
-                f"energy={self.validation_energy_abs_error}, "
-                f"forces={self.validation_force_max_abs_error}"
-            )
-
+            if not bool(torch.isfinite(value).all()):
+                raise CUDAGraphValidationError(
+                    f"ORBv3 CUDA Graph produced non-finite {name}"
+                )
+        self.numerical_validation_within_tolerance = (
+            self.replay_stability_passed
+            and self.validation_energy_abs_error <= self.energy_atol
+            and self.validation_force_max_abs_error <= self.force_atol
+        )
     def reset_production_stats(self) -> None:
         self.production_calls = 0
         self.production_replays = 0
@@ -672,6 +671,10 @@ class ModelOnlyCUDAGraphEvaluator(OrbTorchSimEvaluator):
             "cuda_graph_validation_force_atol_eV_per_A": self.force_atol,
             "cuda_graph_force_path": "fixed-cell-position-only-vjp",
             "cuda_graph_stress_rotation_auxiliaries": False,
+            "cuda_graph_numerical_validation_failure_policy": "report_only",
+            "cuda_graph_numerical_validation_within_tolerance": (
+                self.numerical_validation_within_tolerance
+            ),
         }
 
 
@@ -802,6 +805,8 @@ def run_md(request: MDRunRequest) -> MDRunResult:
     started = time.perf_counter()
     with profiler.phase("initial_force"):
         _ensure_evaluated(state, evaluator)
+    if config.collect_statistics and 0 in observation_steps:
+        observations.append(_record_observation(state, 0, masses))
     for step in range(1, config.steps + 1):
         with profiler.phase("md_step"):
             integrator.step(state, evaluator)

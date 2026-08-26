@@ -534,6 +534,8 @@ def run_md(request: MDRunRequest) -> MDRunResult:
     # Matbench requires the initial frame and every record_interval frame.
     with profiler.phase("initial_force"):
         _ensure_evaluated(state, evaluator)
+    if config.collect_statistics and 0 in observation_steps:
+        observations.append(_record_observation(state, 0, masses))
     if config.collect_trajectory:
         write_frame(0)
     for step in range(1, config.steps + 1):
