@@ -15,6 +15,7 @@ from orb_models.md_stages.opt1 import (
 )
 from orb_models.md_stages.opt3 import (
     WholeStepCUDAGraphRunner,
+    _FixedShapeORBNeighborBuilder,
     _validate_request,
     sink_pad_neighbor_matrix,
     whole_step_in_place_,
@@ -100,11 +101,11 @@ class _HarmonicEvaluator:
 @pytest.mark.parametrize("integrator_name", ["berendsen", "nose_hoover_chain"])
 def test_whole_step_in_place_matches_existing_gpu_integrator(integrator_name):
     masses = torch.tensor([1.0, 2.0], dtype=torch.float64)
-    kwargs = dict(
-        timestep_fs=0.25,
-        temperature_k=300.0,
-        thermostat_time_fs=25.0,
-    )
+    kwargs = {
+        "timestep_fs": 0.25,
+        "temperature_k": 300.0,
+        "thermostat_time_fs": 25.0,
+    }
     if integrator_name == "berendsen":
         reference_integrator = BerendsenIntegrator(
             masses, degrees_of_freedom=6, **kwargs
@@ -165,11 +166,11 @@ def test_whole_step_in_place_matches_existing_gpu_integrator(integrator_name):
 @pytest.mark.parametrize("integrator_name", ["berendsen", "nose_hoover_chain"])
 def test_advance_zero_only_evaluates_initial_force(integrator_name):
     masses = torch.tensor([1.0, 2.0], dtype=torch.float64)
-    kwargs = dict(
-        timestep_fs=0.25,
-        temperature_k=300.0,
-        thermostat_time_fs=25.0,
-    )
+    kwargs = {
+        "timestep_fs": 0.25,
+        "temperature_k": 300.0,
+        "thermostat_time_fs": 25.0,
+    }
     if integrator_name == "berendsen":
         integrator = BerendsenIntegrator(masses, degrees_of_freedom=6, **kwargs)
     else:
@@ -210,12 +211,15 @@ def test_advance_zero_only_evaluates_initial_force(integrator_name):
 
 def test_whole_step_source_contains_builder_model_and_state_update():
     builder = inspect.getsource(WholeStepCUDAGraphRunner._fixed_builder)
+    fixed_builder = inspect.getsource(_FixedShapeORBNeighborBuilder.build)
     body = inspect.getsource(whole_step_in_place_)
     capture = inspect.getsource(WholeStepCUDAGraphRunner.capture)
 
-    assert "nva_neighbor_list" in builder
+    assert "self.fixed_neighbor_builder.build" in builder
+    assert "nva_neighbor_list" not in builder
+    assert "torch.topk" in fixed_builder
     assert "sink_pad_neighbor_matrix" in builder
-    assert "evaluator(positions)" in body
+    assert body.count("evaluator(evaluation_positions)") == 2
     assert "state.positions.copy_" in body
     assert "whole_step_in_place_" in capture
     assert "torch.cuda.graph" in capture
@@ -229,13 +233,32 @@ def test_per_centre_capacity_has_device_overflow_assertion():
     assert "self.maximum_required_neighbors.copy_" in source
 
 
-def test_total_capacity_uses_aligned_guarded_average_and_initial_force_is_timed():
+def test_fixed_candidate_builder_matches_simple_periodic_topology():
+    builder = _FixedShapeORBNeighborBuilder(
+        num_atoms=2,
+        cell=torch.eye(3, dtype=torch.float32) * 8.0,
+        pbc=torch.ones(3, dtype=torch.bool),
+        cutoff=3.0,
+        neighbors_per_atom=2,
+    )
+    matrix, counts, shifts = builder.build(
+        torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+    )
+
+    assert counts.tolist() == [1, 1]
+    assert matrix.tolist() == [[1, -1], [0, -1]]
+    assert torch.equal(shifts, torch.zeros_like(shifts))
+
+
+def test_total_capacity_uses_single_guard_and_initial_force_is_timed():
     init_source = inspect.getsource(WholeStepCUDAGraphRunner.__init__)
     run_source = inspect.getsource(__import__(
         "orb_models.md_stages.opt3", fromlist=["run_md"]
     ).run_md)
     assert "self.capacity_alignment = 8" in init_source
-    assert "self.capacity_guard_slots = 8 if" in init_source
+    assert "self.capacity_guard_slots = 0" in init_source
+    assert "self.capacity_total_floor" in init_source
+    assert "self.capacity_initial_safe_slots" in init_source
     assert 'profiler.phase("initial_force")' in run_source
     assert "expected_replays = config.steps + 1" in run_source
 

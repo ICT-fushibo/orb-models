@@ -81,6 +81,22 @@ def edge_capacity_from_probe(
     return int(math.ceil(required / edge_step) * edge_step)
 
 
+def _maximum_neighbors_per_atom(
+    edge_index: torch.Tensor,
+    *,
+    num_atoms: int,
+) -> int:
+    """Return the largest ORB sender degree during a capacity probe."""
+    if num_atoms < 1:
+        raise ValueError("num_atoms must be positive")
+    if edge_index.ndim != 2 or edge_index.shape[0] != 2:
+        raise ValueError("edge_index must have shape [2, num_edges]")
+    if edge_index.shape[1] == 0:
+        return 0
+    counts = torch.bincount(edge_index[0], minlength=num_atoms)[:num_atoms]
+    return int(counts.max().item())
+
+
 @torch.no_grad()
 def staticize_graph_inputs_(
     static_positions: torch.Tensor,
@@ -267,6 +283,7 @@ class ModelOnlyCUDAGraphEvaluator(OrbTorchSimEvaluator):
         requested_edge_capacity: int | None,
         edge_margin: float,
         edge_step: int,
+        track_neighbor_capacity: bool,
         capture_warmup: int,
         energy_atol: float,
         force_atol: float,
@@ -300,6 +317,7 @@ class ModelOnlyCUDAGraphEvaluator(OrbTorchSimEvaluator):
         self.requested_edge_capacity = requested_edge_capacity
         self.edge_margin = float(edge_margin)
         self.edge_step = int(edge_step)
+        self.track_neighbor_capacity = bool(track_neighbor_capacity)
         self.capture_warmup = int(capture_warmup)
         self.energy_atol = float(energy_atol)
         self.force_atol = float(force_atol)
@@ -340,6 +358,8 @@ class ModelOnlyCUDAGraphEvaluator(OrbTorchSimEvaluator):
         self.capacity_misses = 0
         self.min_real_edges: int | None = None
         self.max_real_edges: int | None = None
+        self.initial_max_neighbors_per_atom: int | None = None
+        self.max_neighbors_per_atom: int | None = None
         self.output_addresses_stable = False
         self.input_addresses_stable = False
         self._capture_input_addresses: tuple[tuple[str, int], ...] | None = None
@@ -503,6 +523,12 @@ class ModelOnlyCUDAGraphEvaluator(OrbTorchSimEvaluator):
         eager_forces, eager_energy, _stress = OrbTorchSimEvaluator.__call__(self, positions)
         model_positions, edge_index, unit_shifts = self._build_real_inputs(positions)
         probed_edges = int(edge_index.shape[1])
+        if self.track_neighbor_capacity:
+            self.initial_max_neighbors_per_atom = _maximum_neighbors_per_atom(
+                edge_index,
+                num_atoms=self.n_real,
+            )
+            self.max_neighbors_per_atom = self.initial_max_neighbors_per_atom
         capacity = self.requested_edge_capacity or edge_capacity_from_probe(
             probed_edges,
             margin=self.edge_margin,
@@ -603,12 +629,23 @@ class ModelOnlyCUDAGraphEvaluator(OrbTorchSimEvaluator):
         self.capacity_misses = 0
         self.min_real_edges = None
         self.max_real_edges = None
+        self.max_neighbors_per_atom = self.initial_max_neighbors_per_atom
 
     def __call__(self, positions: torch.Tensor):
         if not self.captured or self.cuda_graph is None:
             raise RuntimeError("ORBv3 CUDA Graph must be captured before replay")
         model_positions, edge_index, unit_shifts = self._build_real_inputs(positions)
         num_edges = int(edge_index.shape[1])
+        if self.track_neighbor_capacity:
+            maximum = _maximum_neighbors_per_atom(
+                edge_index,
+                num_atoms=self.n_real,
+            )
+            self.max_neighbors_per_atom = (
+                maximum
+                if self.max_neighbors_per_atom is None
+                else max(self.max_neighbors_per_atom, maximum)
+            )
         self.production_calls += 1
         if num_edges > self.edge_capacity:
             self.capacity_misses += 1
@@ -653,6 +690,8 @@ class ModelOnlyCUDAGraphEvaluator(OrbTorchSimEvaluator):
             "cuda_graph_edge_capacity": self.edge_capacity,
             "cuda_graph_min_real_edges": self.min_real_edges,
             "cuda_graph_max_real_edges": self.max_real_edges,
+            "cuda_graph_max_neighbors_per_atom": self.max_neighbors_per_atom,
+            "capacity_probe_collect_per_atom": self.track_neighbor_capacity,
             "cuda_graph_dummy_atoms": 1,
             "cuda_graph_capture_warmup": self.capture_warmup,
             "cuda_graph_capture_wall_time_s": self.capture_wall_time_s,
@@ -780,6 +819,9 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         ),
         edge_margin=float(request.options.get("cuda_graph_edge_margin", 0.25)),
         edge_step=int(request.options.get("cuda_graph_edge_step", 128)),
+        track_neighbor_capacity=bool(
+            request.options.get("capacity_probe_collect_per_atom", False)
+        ),
         capture_warmup=int(request.options.get("cuda_graph_capture_warmup", 3)),
         energy_atol=float(request.options.get("cuda_graph_energy_atol_ev", 2e-4)),
         force_atol=float(

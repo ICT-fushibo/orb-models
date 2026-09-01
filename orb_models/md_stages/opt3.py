@@ -1,7 +1,7 @@
 """ORBv3 Opt3: one whole-step CUDA Graph for GPU-resident NVT MD.
 
 The captured region closes the complete hot-loop over persistent CUDA tensors:
-the thermostat/integrator update, fixed-capacity Alchemi neighbor construction,
+the thermostat/integrator update, fixed-candidate PBC neighbor construction,
 sink-padded ORB forward/force VJP, and final state update.  Capacity is fixed
 before capture and overflow is a hard error.  This stage deliberately does not
 implement recapture, graph buckets, transaction rollback, compile, or fusion.
@@ -110,6 +110,136 @@ def _pad_node_tensor(value: torch.Tensor, n_real: int, n_dummy: int) -> torch.Te
         dummy = value[:1].expand(n_dummy, *value.shape[1:]).clone()
         return torch.cat((value, dummy), dim=0)
     return value.clone()
+
+
+def _pbc_repetitions(
+    cell: torch.Tensor, cutoff: float, pbc: torch.Tensor
+) -> tuple[int, int, int]:
+    """Resolve a complete periodic image range during setup only."""
+
+    cell_cpu = cell.detach().to(device="cpu", dtype=torch.float64).reshape(3, 3)
+    pbc_cpu = pbc.detach().to(device="cpu", dtype=torch.bool).reshape(3)
+    cross_a2a3 = torch.cross(cell_cpu[1], cell_cpu[2], dim=0)
+    volume = torch.dot(cell_cpu[0], cross_a2a3)
+    if not bool(torch.isfinite(volume)) or float(volume.abs()) == 0.0:
+        raise ValueError("ORBv3 Opt3 cannot enumerate a singular periodic cell")
+    reciprocal = (
+        cross_a2a3,
+        torch.cross(cell_cpu[2], cell_cpu[0], dim=0),
+        torch.cross(cell_cpu[0], cell_cpu[1], dim=0),
+    )
+    repetitions = []
+    for axis in range(3):
+        if bool(pbc_cpu[axis]):
+            inverse_plane_distance = torch.linalg.vector_norm(
+                reciprocal[axis] / volume
+            )
+            repetitions.append(
+                int(torch.ceil(cutoff * inverse_plane_distance).item())
+            )
+        else:
+            repetitions.append(0)
+    return tuple(repetitions)  # type: ignore[return-value]
+
+
+class _FixedShapeORBNeighborBuilder:
+    """Capture-safe fixed candidate form of ORB's single-system PBC graph.
+
+    The PBC image universe and candidate receiver IDs are frozen at setup.
+    Replay performs only fixed-shape distance, mask, and top-k tensor work;
+    setup-only nvalchemi operations never enter stream capture.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_atoms: int,
+        cell: torch.Tensor,
+        pbc: torch.Tensor,
+        cutoff: float,
+        neighbors_per_atom: int,
+    ) -> None:
+        if num_atoms < 2:
+            raise ValueError("ORBv3 fixed builder requires at least two atoms")
+        if cutoff <= 0.0:
+            raise ValueError("ORBv3 fixed builder cutoff must be positive")
+        if neighbors_per_atom < 1:
+            raise ValueError("ORBv3 neighbors_per_atom must be positive")
+        self.num_atoms = int(num_atoms)
+        self.cutoff = float(cutoff)
+        self.neighbors_per_atom = int(neighbors_per_atom)
+        self.device = cell.device
+        self.cell = cell.detach().reshape(3, 3).contiguous()
+        self.repetitions = _pbc_repetitions(self.cell, self.cutoff, pbc)
+        axes = [
+            torch.arange(
+                -repeat,
+                repeat + 1,
+                dtype=self.cell.dtype,
+                device=self.device,
+            )
+            for repeat in self.repetitions
+        ]
+        self.unit_shifts = torch.cartesian_prod(*axes).reshape(-1, 3).contiguous()
+        self.num_cells = int(self.unit_shifts.shape[0])
+        self.candidates_per_atom = self.num_atoms * self.num_cells
+        if self.neighbors_per_atom > self.candidates_per_atom:
+            raise ValueError(
+                "ORBv3 neighbor capacity exceeds the complete PBC universe"
+            )
+        self.candidate_receivers = torch.arange(
+            self.num_atoms, dtype=torch.long, device=self.device
+        ).repeat_interleave(self.num_cells)
+        self.candidate_shifts = self.unit_shifts.repeat(self.num_atoms, 1)
+        self.infinity = torch.tensor(
+            float("inf"), dtype=self.cell.dtype, device=self.device
+        )
+
+    def build(
+        self, positions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return fixed receiver slots, exact counts, and lattice shifts."""
+
+        if positions.shape != (self.num_atoms, 3):
+            raise ValueError("ORBv3 fixed builder received the wrong atom shape")
+        receiver_positions = positions.index_select(0, self.candidate_receivers)
+        shift_vectors = torch.mm(
+            self.candidate_shifts.to(dtype=positions.dtype),
+            self.cell.to(dtype=positions.dtype),
+        )
+        vectors = (
+            receiver_positions.unsqueeze(0)
+            - positions.unsqueeze(1)
+            + shift_vectors.unsqueeze(0)
+        )
+        distance_sqr = vectors.square().sum(dim=-1)
+        valid = (distance_sqr <= self.cutoff * self.cutoff) & (
+            distance_sqr > 1.0e-8
+        )
+        counts = valid.sum(dim=1)
+        masked_distance = torch.where(valid, distance_sqr, self.infinity)
+        selected_distance, selected = torch.topk(
+            masked_distance,
+            k=self.neighbors_per_atom,
+            dim=1,
+            largest=False,
+            sorted=True,
+        )
+        selected_valid = torch.isfinite(selected_distance)
+        flat = selected.reshape(-1)
+        receivers = self.candidate_receivers.index_select(0, flat).reshape(
+            self.num_atoms, self.neighbors_per_atom
+        )
+        shifts = self.candidate_shifts.index_select(0, flat).reshape(
+            self.num_atoms, self.neighbors_per_atom, 3
+        )
+        receivers = torch.where(
+            selected_valid, receivers, torch.full_like(receivers, -1)
+        )
+        shifts = torch.where(
+            selected_valid.unsqueeze(-1), shifts, torch.zeros_like(shifts)
+        )
+        return receivers, counts, shifts
 
 
 class _RealAtomPairRepulsion(nn.Module):
@@ -272,9 +402,6 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
         self.real_n_node = self.template.n_node
         self.model_cell = self.template.system_features["cell"].reshape(-1, 3, 3).contiguous()
         self.model_pbc = self.sim_state.pbc.view(-1, 3).contiguous()
-        self.batch_ptr = torch.tensor(
-            [0, self.n_real], dtype=torch.int32, device=self.device
-        )
         self.radius = float(self.template.radius)
         self.model_neighbor_limit = int(self.max_num_neighbors)
 
@@ -287,29 +414,42 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
         capacity = requested_edge_capacity or edge_capacity_from_probe(
             initial_edge_count, margin=edge_margin, edge_step=edge_step
         )
-        self.capacity_average_derived = requested_neighbors_per_atom is None
-        self.capacity_alignment = 8
-        self.capacity_guard_slots = 8 if self.capacity_average_derived else 0
-        self.capacity_average_slots = int(math.ceil(capacity / self.n_real))
-        if requested_neighbors_per_atom is not None:
-            slots = int(requested_neighbors_per_atom)
-        else:
-            slots = (
-                int(
-                    math.ceil(
-                        self.capacity_average_slots / self.capacity_alignment
-                    )
-                )
-                * self.capacity_alignment
-                + self.capacity_guard_slots
-            )
-        slots = min(slots, self.raw_neighbor_capacity)
-        if self.model_neighbor_limit > 0:
-            slots = min(slots, self.model_neighbor_limit)
         initial_per_sender = torch.bincount(
             initial_edges[0], minlength=self.n_real
         )
         required_slots = int(initial_per_sender.max().item())
+        self.capacity_average_derived = requested_neighbors_per_atom is None
+        self.capacity_alignment = 8
+        self.capacity_guard_slots = 0
+        self.capacity_average_slots = math.ceil(capacity / self.n_real)
+        self.capacity_total_floor = (
+            math.ceil(self.capacity_average_slots / self.capacity_alignment)
+            * self.capacity_alignment
+        )
+        guarded_initial = max(
+            required_slots + 1,
+            math.ceil(required_slots * (1.0 + edge_margin)),
+        )
+        self.capacity_initial_safe_slots = (
+            math.ceil(guarded_initial / self.capacity_alignment)
+            * self.capacity_alignment
+        )
+        if requested_neighbors_per_atom is not None:
+            # The trajectory per-sender probe is authoritative for the
+            # uniform CAP.  The separately aligned total-edge buffer can be
+            # much larger for tiny systems because of its 256-edge alignment;
+            # projecting that padding back onto every sender would overpad.
+            slots = int(requested_neighbors_per_atom)
+            self.capacity_source = "trajectory-total-and-per-atom-probe"
+        else:
+            slots = max(
+                self.capacity_total_floor,
+                self.capacity_initial_safe_slots,
+            )
+            self.capacity_source = "total-edge-plus-initial-per-atom"
+        slots = min(slots, self.raw_neighbor_capacity)
+        if self.model_neighbor_limit > 0:
+            slots = min(slots, self.model_neighbor_limit)
         if required_slots > slots:
             raise CUDAGraphCapacityError(required_slots * self.n_real, slots * self.n_real)
         self.slots_per_atom = slots
@@ -330,6 +470,24 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
         cell = self.model_cell[0].to(torch.float64)
         self.inverse_cell = torch.linalg.inv(cell).contiguous()
         self.periodic_mask = self.model_pbc[0].to(torch.bool).view(1, 3)
+        self.fixed_neighbor_builder = _FixedShapeORBNeighborBuilder(
+            num_atoms=self.n_real,
+            cell=self.model_cell[0],
+            pbc=self.model_pbc[0],
+            cutoff=self.radius,
+            neighbors_per_atom=self.slots_per_atom,
+        )
+        (
+            _fixed_initial_matrix,
+            fixed_initial_counts,
+            _fixed_initial_shifts,
+        ) = self.fixed_neighbor_builder.build(model_positions)
+        fixed_required_slots = int(fixed_initial_counts.max().item())
+        if fixed_required_slots != required_slots:
+            raise RuntimeError(
+                "ORBv3 Opt3 fixed candidate builder disagrees with the setup "
+                f"nvalchemi probe: {fixed_required_slots} != {required_slots}"
+            )
         cell_norms = torch.linalg.vector_norm(cell, dim=1)
         axis = int(cell_norms.argmax().item())
         axis_length = float(cell_norms[axis].item())
@@ -470,27 +628,13 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
 
     def _fixed_builder(self, positions: torch.Tensor):
         model_positions = self._wrap_positions(positions)
-        neighbor_matrix, num_neighbors, shift_matrix = graph_feat.nva_neighbor_list(
-            positions=model_positions,
-            cell=self.model_cell,
-            pbc=self.model_pbc,
-            cutoff=self.radius,
-            batch_ptr=self.batch_ptr,
-            fill_value=-1,
-            max_neighbors=self.raw_neighbor_capacity,
-            wrap_positions=False,
+        neighbor_matrix, num_neighbors, shift_matrix = (
+            self.fixed_neighbor_builder.build(model_positions)
         )
         required_neighbors = num_neighbors.max()
-        raw_excess = torch.clamp_min(
-            required_neighbors - self.raw_neighbor_capacity, 0
+        capacity_excess = torch.clamp_min(
+            required_neighbors - self.slots_per_atom, 0
         )
-        if self.capacity_limit_enforced:
-            slot_excess = torch.clamp_min(
-                required_neighbors - self.slots_per_atom, 0
-            )
-        else:
-            slot_excess = torch.zeros_like(required_neighbors)
-        capacity_excess = torch.maximum(raw_excess, slot_excess)
         self.capacity_misses.add_((capacity_excess > 0).to(torch.long))
         self.maximum_required_neighbors.copy_(
             torch.maximum(self.maximum_required_neighbors, required_neighbors)
@@ -498,23 +642,12 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
         self.maximum_capacity_excess.copy_(
             torch.maximum(self.maximum_capacity_excess, capacity_excess)
         )
-        torch._assert_async(num_neighbors.max() <= self.raw_neighbor_capacity)
-
-        # A CAP below the checkpoint's semantic neighbor limit is legal only
-        # while every atom fits.  A later excursion fails instead of truncating.
-        if self.capacity_limit_enforced:
-            torch._assert_async(num_neighbors.max() <= self.slots_per_atom)
-        neighbor_matrix, _selected_counts, shift_matrix = (
-            graph_feat.select_k_neighbors_from_alchemi_neighbor_matrix(
-                positions=model_positions,
-                cells=self.model_cell.expand(self.n_real, -1, -1),
-                neighbor_matrix=neighbor_matrix,
-                num_neighbors=num_neighbors,
-                neighbor_shift_matrix=shift_matrix,
-                max_number_neighbors=self.slots_per_atom,
-                fill_value=-1,
-                truncate_to_observed=False,
-            )
+        # Capacity overflow is a hard device-side failure.  There is no
+        # truncation, recapture, eager fallback, or transaction rollback.
+        torch._assert_async(
+            num_neighbors.max() <= self.slots_per_atom,
+            "ORBv3 Opt3 per-atom neighbor capacity exceeded; increase "
+            "whole_step_neighbors_per_atom and restart",
         )
         senders, receivers, shifts, valid = sink_pad_neighbor_matrix(
             neighbor_matrix,
@@ -816,10 +949,27 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
             "cuda_graph_neighbors_per_atom": self.slots_per_atom,
             "cuda_graph_capacity_average_derived": self.capacity_average_derived,
             "cuda_graph_capacity_average_slots": self.capacity_average_slots,
+            "cuda_graph_capacity_total_floor": self.capacity_total_floor,
+            "cuda_graph_capacity_initial_safe_slots": (
+                self.capacity_initial_safe_slots
+            ),
+            "cuda_graph_capacity_source": self.capacity_source,
             "cuda_graph_capacity_alignment": self.capacity_alignment,
             "cuda_graph_capacity_guard_slots": self.capacity_guard_slots,
             "cuda_graph_capacity_limit_enforced": self.capacity_limit_enforced,
             "cuda_graph_raw_neighbor_capacity": self.raw_neighbor_capacity,
+            "cuda_graph_neighbor_backend": "orb-fixed-candidate-cap",
+            "cuda_graph_capture_safe_setup_hoisted": True,
+            "cuda_graph_candidate_universe_size": (
+                self.n_real * self.fixed_neighbor_builder.candidates_per_atom
+            ),
+            "cuda_graph_candidates_per_atom": (
+                self.fixed_neighbor_builder.candidates_per_atom
+            ),
+            "cuda_graph_num_pbc_cells": self.fixed_neighbor_builder.num_cells,
+            "cuda_graph_pbc_repetitions": list(
+                self.fixed_neighbor_builder.repetitions
+            ),
             "cuda_graph_min_real_edges": minimum,
             "cuda_graph_max_real_edges": maximum,
             "cuda_graph_dummy_atoms": self.n_dummy,

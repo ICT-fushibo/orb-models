@@ -17,6 +17,7 @@ from orb_models.md_stages.opt2 import (
     ModelOnlyCUDAGraphEvaluator,
     _ORBForceOnlyModel,
     _RealAtomPairRepulsion,
+    _maximum_neighbors_per_atom,
     _validate_request,
     edge_capacity_from_probe,
     staticize_graph_inputs_,
@@ -84,6 +85,13 @@ def test_opt2_rejects_extra_acceleration_options(option):
 def test_edge_capacity_has_headroom_and_alignment():
     assert edge_capacity_from_probe(128, margin=0.25, edge_step=128) == 256
     assert edge_capacity_from_probe(100, margin=0.0, edge_step=16) == 112
+
+
+def test_probe_maximum_neighbors_uses_orb_sender_axis():
+    edge_index = torch.tensor(
+        [[0, 0, 1, 2, 2, 2], [1, 2, 0, 0, 1, 3]], dtype=torch.long
+    )
+    assert _maximum_neighbors_per_atom(edge_index, num_atoms=4) == 3
 
 
 @pytest.mark.parametrize("reduction", ["sum", "mean", "max"])
@@ -206,6 +214,9 @@ def test_production_replay_never_recaptures_or_falls_back():
     evaluator.capacity_misses = 0
     evaluator.min_real_edges = None
     evaluator.max_real_edges = None
+    evaluator.initial_max_neighbors_per_atom = None
+    evaluator.max_neighbors_per_atom = None
+    evaluator.track_neighbor_capacity = False
     evaluator.static_forces = torch.ones(2, 3)
     evaluator.static_energy = torch.tensor([2.0])
     evaluator._build_real_inputs = lambda positions: (
