@@ -15,9 +15,9 @@ from orb_models.common.models import segment_ops
 from orb_models.md_stages.opt2 import (
     CUDAGraphCapacityError,
     ModelOnlyCUDAGraphEvaluator,
+    _maximum_neighbors_per_atom,
     _ORBForceOnlyModel,
     _RealAtomPairRepulsion,
-    _maximum_neighbors_per_atom,
     _validate_request,
     edge_capacity_from_probe,
     staticize_graph_inputs_,

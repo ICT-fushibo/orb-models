@@ -250,6 +250,38 @@ def test_fixed_candidate_builder_matches_simple_periodic_topology():
     assert torch.equal(shifts, torch.zeros_like(shifts))
 
 
+def test_skin_builder_matches_full_search_with_per_atom_cap():
+    positions = torch.tensor([[0.1, 0.0, 0.0], [4.8, 0.0, 0.0]])
+    options = dict(
+        num_atoms=2,
+        cell=torch.eye(3) * 5.0,
+        pbc=torch.ones(3, dtype=torch.bool),
+        cutoff=1.0,
+        neighbors_per_atom=2,
+        neighbor_capacities=[1, 2],
+    )
+    full = _FixedShapeORBNeighborBuilder(**options)
+    skin = _FixedShapeORBNeighborBuilder(
+        **options, verlet_skin=0.5, verlet_candidate_capacity=4
+    )
+    skin.initialize_skin(positions)
+
+    full_output = full.build(positions)
+    skin_output = skin.build(positions)
+    for actual, expected in zip(skin_output, full_output):
+        torch.testing.assert_close(actual, expected)
+    assert skin.edge_capacity == 3
+
+    moved_wrapped = positions.clone()
+    moved_wrapped[0, 0] = 4.9
+    image_offsets = torch.zeros_like(positions)
+    image_offsets[0, 0] = -1.0
+    for actual, expected in zip(
+        skin.build(moved_wrapped, image_offsets), full.build(moved_wrapped)
+    ):
+        torch.testing.assert_close(actual, expected)
+
+
 def test_total_capacity_uses_single_guard_and_initial_force_is_timed():
     init_source = inspect.getsource(WholeStepCUDAGraphRunner.__init__)
     run_source = inspect.getsource(__import__(
