@@ -28,6 +28,12 @@ from md_benchmark.neighbor_utils import (
     normalize_neighbor_capacities,
     select_skin_candidates,
 )
+from md_benchmark.opt3_profile import (
+    model_nvtx_ranges,
+    nvtx_stage,
+    nvtx_steps,
+    profile_opt3,
+)
 from md_benchmark.performance import CudaPhaseProfiler, performance_profile_requested
 from torch import nn
 
@@ -60,6 +66,8 @@ from orb_models.md_stages.opt2 import (
     _RealAtomEnergyHead,
     edge_capacity_from_probe,
 )
+
+
 def sink_pad_neighbor_matrix(
     neighbor_matrix: torch.Tensor,
     unit_shift_matrix: torch.Tensor,
@@ -433,6 +441,7 @@ class _RealAtomPairRepulsion(nn.Module):
         return {**output, "energy": output["energy"] * self.scale}
 
 
+@nvtx_stage("integrator_thermostat")
 def whole_step_in_place_(
     state: GPUMDState,
     integrator: BerendsenIntegrator | NoseHooverChainIntegrator,
@@ -863,6 +872,7 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
         wrapped, _ = self._wrap_positions_and_images(positions)
         return wrapped
 
+    @nvtx_stage("neighbor_geometry")
     def _fixed_builder(self, positions: torch.Tensor):
         model_positions, image_offsets = self._wrap_positions_and_images(positions)
         neighbor_matrix, num_neighbors, shift_matrix = (
@@ -920,7 +930,7 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
         self.static_batch.senders = senders
         self.static_batch.receivers = receivers
         self.static_batch.edge_features["unit_shifts"] = shifts
-        with torch.enable_grad():
+        with model_nvtx_ranges(self.force_only_model), torch.enable_grad():
             forces, energy = self.force_only_model(self.static_batch)
         return (
             forces[: self.n_real].detach().to(torch.float64),
@@ -1338,6 +1348,7 @@ def _validate_request(request: MDRunRequest) -> tuple[str, int | None]:
     return variant, max_num_neighbors
 
 
+@profile_opt3
 def run_md(request: MDRunRequest) -> MDRunResult:
     """Run ORBv3 NVT MD with exactly one whole-step CUDA Graph."""
 
@@ -1368,7 +1379,7 @@ def run_md(request: MDRunRequest) -> MDRunResult:
     ).clone()
     integrator = _build_integrator(request, masses)
     profiler = CudaPhaseProfiler(
-        enabled=performance_profile_requested(request.options), device=device
+        enabled=performance_profile_requested(request.options), device=device, prefix="opt3"
     )
     requested_capacity = request.options.get(
         "cuda_graph_edge_capacity",
@@ -1436,7 +1447,7 @@ def run_md(request: MDRunRequest) -> MDRunResult:
     runner.advance.fill_(1.0)
     if config.collect_statistics and 0 in observation_steps:
         observations.append(_record_observation(state, 0, masses))
-    for step in range(1, config.steps + 1):
+    for step in nvtx_steps(config.steps, device):
         with profiler.phase("whole_step_replay"):
             runner.replay()
         if config.collect_statistics and step in observation_steps:
