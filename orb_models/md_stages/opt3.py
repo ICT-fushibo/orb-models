@@ -543,6 +543,7 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
         n_dummy: int,
         energy_atol: float,
         force_atol: float,
+        opt4_options: dict | None = None,
     ) -> None:
         super().__init__(
             atoms,
@@ -740,6 +741,10 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
             self.model.model.pair_repulsion_fn = _RealAtomPairRepulsion(
                 self.model.model.pair_repulsion_fn, self.n_real, self.n_dummy
             )
+        if opt4_options and opt4_options.get("_opt4_passes"):
+            from md_benchmark.opt4_registry import prepare_model
+            from .opt4_fusion import install
+            prepare_model(self.model.model, opt4_options, install)
         self.force_only_model = _ORBForceOnlyModel(self.model.model).eval()
         self._initialize_batch(model_positions)
 
@@ -1388,6 +1393,7 @@ def run_md(request: MDRunRequest) -> MDRunResult:
     runner = WholeStepCUDAGraphRunner(
         atoms,
         request.model_path,
+        opt4_options=request.options,
         variant=variant,
         device=device,
         max_num_neighbors=max_num_neighbors,
