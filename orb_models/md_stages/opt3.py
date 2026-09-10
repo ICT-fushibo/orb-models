@@ -21,6 +21,15 @@ import torch
 from ase import units
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 from md_benchmark.md_route import MDRunRequest, MDRunResult, validate_result
+from md_benchmark.cap1_rob1 import (
+    FixedAddressStateSnapshot,
+    Rob1Controller,
+    Rob1WindowStatus,
+    VerletCandidateCapacityError,
+    read_rob1_window_status,
+    transaction_boundaries,
+    verlet_rebuild_due,
+)
 from md_benchmark.neighbor_utils import (
     capacities_from_counts,
     displacement_exceeds_skin,
@@ -79,6 +88,7 @@ def sink_pad_neighbor_matrix(
     _slot_centres: torch.Tensor | None = None,
     _selection_indices: torch.Tensor | None = None,
     _edge_capacity: int | None = None,
+    force_dummy_only: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Flatten fixed per-atom slots and isolate invalid rows on dummy sinks.
 
@@ -121,6 +131,8 @@ def sink_pad_neighbor_matrix(
         0, selection_indices
     )
     valid = flat_matrix != -1
+    if force_dummy_only is not None:
+        valid = valid & ~force_dummy_only
     real_senders = slot_centres.to(dtype=neighbor_matrix.dtype)
     sink_ids = n_real + (
         torch.arange(
@@ -194,6 +206,7 @@ class _FixedShapeORBNeighborBuilder:
         neighbor_capacities: list[int] | torch.Tensor | None = None,
         verlet_skin: float = 0.0,
         verlet_candidate_capacity: int | None = None,
+        defer_skin_error: bool = False,
     ) -> None:
         if num_atoms < 2:
             raise ValueError("ORBv3 fixed builder requires at least two atoms")
@@ -222,6 +235,7 @@ class _FixedShapeORBNeighborBuilder:
             raise ValueError("verlet_skin must be non-negative")
         self.verlet_skin = float(verlet_skin)
         self.verlet_candidate_capacity = verlet_candidate_capacity
+        self.defer_skin_error = bool(defer_skin_error)
         self.skin_candidate_ids: torch.Tensor | None = None
         self.skin_candidate_mask: torch.Tensor | None = None
         self.skin_reference_positions: torch.Tensor | None = None
@@ -283,11 +297,11 @@ class _FixedShapeORBNeighborBuilder:
             cutoff=self.cutoff + self.verlet_skin,
             slots_per_atom=slots,
         )
-        torch._assert_async(
-            (counts <= slots).all(),
-            "ORBv3 Opt3 Verlet candidate capacity is smaller than the "
-            "cutoff+skin candidate count",
-        )
+        if bool((counts > slots).any().item()):
+            raise VerletCandidateCapacityError(
+                "ORBv3 Opt3 Verlet candidate capacity is smaller than the "
+                "cutoff+skin candidate count"
+            )
         if self.skin_candidate_ids is None:
             self.skin_candidate_ids = selected
             self.skin_candidate_mask = selected_valid
@@ -330,10 +344,11 @@ class _FixedShapeORBNeighborBuilder:
                 self.inverse_cell,
             )
             self.skin_misses.add_(skin_miss.to(torch.long))
-            torch._assert_async(
-                ~skin_miss,
-                "ORBv3 Opt3 Verlet skin exhausted; rebuild the candidate list",
-            )
+            if not self.defer_skin_error:
+                torch._assert_async(
+                    ~skin_miss,
+                    "ORBv3 Opt3 Verlet skin exhausted; rebuild the candidate list",
+                )
             cached = self.skin_candidate_ids.reshape(-1)
             candidate_receivers = self.candidate_receivers.index_select(
                 0, cached
@@ -447,6 +462,7 @@ def whole_step_in_place_(
     integrator: BerendsenIntegrator | NoseHooverChainIntegrator,
     evaluator,
     advance: torch.Tensor | None = None,
+    step_counter: torch.Tensor | None = None,
 ) -> None:
     """Evaluate/advance NVT while retaining every persistent tensor address.
 
@@ -516,6 +532,8 @@ def whole_step_in_place_(
     state.momenta.copy_(old_momenta + advance * (proposed_momenta - old_momenta))
     state.forces.copy_(forces)
     state.potential_energy.copy_(energy)
+    if step_counter is not None:
+        step_counter.add_(advance.to(torch.long))
 
 
 class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
@@ -544,16 +562,22 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
         energy_atol: float,
         force_atol: float,
         opt4_options: dict | None = None,
+        shared_evaluator: OrbTorchSimEvaluator | None = None,
+        model_already_prepared: bool = False,
+        initial_positions: torch.Tensor | None = None,
     ) -> None:
-        super().__init__(
-            atoms,
-            model_path,
-            variant=variant,
-            device=device,
-            max_num_neighbors=max_num_neighbors,
-            compute_stress=False,
-            profiler=profiler,
-        )
+        if shared_evaluator is None:
+            super().__init__(
+                atoms,
+                model_path,
+                variant=variant,
+                device=device,
+                max_num_neighbors=max_num_neighbors,
+                compute_stress=False,
+                profiler=profiler,
+            )
+        else:
+            self.__dict__.update(shared_evaluator.__dict__)
         if requested_edge_capacity is not None and requested_edge_capacity < 1:
             raise ValueError("cuda_graph_edge_capacity must be positive")
         if requested_neighbors_per_atom is not None and requested_neighbors_per_atom < 1:
@@ -591,8 +615,15 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
         self.energy_atol = float(energy_atol)
         self.force_atol = float(force_atol)
         self.n_real = self.num_atoms
+        self.overflow_to_dummy_only = bool(
+            (opt4_options or {}).get("overflow_to_dummy_only", False)
+        )
 
-        self.sim_state.positions = self.sim_state.positions.contiguous()
+        self.sim_state.positions = (
+            self.sim_state.positions
+            if initial_positions is None
+            else initial_positions.to(dtype=self.sim_state.positions.dtype)
+        ).contiguous()
         self.template = self.model._make_batch(self.sim_state)
         raw_capacity = self.model.alchemi_neighbor_state.max_neighbors
         if raw_capacity is None:
@@ -686,11 +717,12 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
 
         # Preserve one released-path reference before replacing the energy/ZBL
         # reductions with real-atom-only variants for sink padding.
-        (
-            self.reference_initial_forces,
-            self.reference_initial_energy,
-            _reference_stress,
-        ) = OrbTorchSimEvaluator.__call__(self, self.sim_state.positions)
+        if not model_already_prepared:
+            (
+                self.reference_initial_forces,
+                self.reference_initial_energy,
+                _reference_stress,
+            ) = OrbTorchSimEvaluator.__call__(self, self.sim_state.positions)
 
         cell = self.model_cell[0].to(torch.float64)
         self.inverse_cell = torch.linalg.inv(cell).contiguous()
@@ -704,6 +736,7 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
             neighbor_capacities=self.neighbor_capacities,
             verlet_skin=self.verlet_skin,
             verlet_candidate_capacity=self.verlet_candidate_capacity,
+            defer_skin_error=self.overflow_to_dummy_only,
         )
         _, initial_image_offsets = self._wrap_positions_and_images(
             self.sim_state.positions
@@ -733,22 +766,29 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
         )
         self.padding_unit_shift[axis] = float(multiple)
 
-        energy_head = self.model.model.heads["energy"]
-        self.model.model.heads["energy"] = _RealAtomEnergyHead(
-            energy_head, self.n_real, self.device
-        )
-        if self.model.model.pair_repulsion:
-            self.model.model.pair_repulsion_fn = _RealAtomPairRepulsion(
-                self.model.model.pair_repulsion_fn, self.n_real, self.n_dummy
+        if not model_already_prepared:
+            energy_head = self.model.model.heads["energy"]
+            self.model.model.heads["energy"] = _RealAtomEnergyHead(
+                energy_head, self.n_real, self.device
             )
-        if opt4_options and opt4_options.get("_opt4_passes"):
-            from md_benchmark.opt4_registry import prepare_model
-            from .opt4_fusion import install
-            prepare_model(self.model.model, opt4_options, install)
+            if self.model.model.pair_repulsion:
+                self.model.model.pair_repulsion_fn = _RealAtomPairRepulsion(
+                    self.model.model.pair_repulsion_fn, self.n_real, self.n_dummy
+                )
+            if opt4_options and opt4_options.get("_opt4_passes"):
+                from md_benchmark.opt4_registry import prepare_model
+                from .opt4_fusion import install
+
+                prepare_model(self.model.model, opt4_options, install)
         self.force_only_model = _ORBForceOnlyModel(self.model.model).eval()
         self._initialize_batch(model_positions)
+        if model_already_prepared:
+            recovery_forces, recovery_energy, _ = self(self.sim_state.positions)
+            self.reference_initial_forces = recovery_forces.detach().clone()
+            self.reference_initial_energy = recovery_energy.detach().clone()
 
         self.advance = torch.ones((), dtype=torch.float64, device=self.device)
+        self.step_counter = torch.zeros((), dtype=torch.long, device=self.device)
         self.cuda_graph: torch.cuda.CUDAGraph | None = None
         self.captured = False
         self.capture_count = 0
@@ -758,6 +798,15 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
         self._captured_positions: torch.Tensor | None = None
         self.capacity_misses = torch.zeros(
             (), dtype=torch.long, device=self.device
+        )
+        self.window_capacity_misses = torch.zeros(
+            (), dtype=torch.long, device=self.device
+        )
+        self.window_dummy_only_replays = torch.zeros(
+            (), dtype=torch.long, device=self.device
+        )
+        self.window_maximum_required_by_atom = torch.zeros(
+            self.n_real, dtype=torch.long, device=self.device
         )
         self.maximum_required_neighbors = torch.zeros(
             (), dtype=torch.long, device=self.device
@@ -890,7 +939,17 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
             0,
         )
         capacity_excess = capacity_excess_by_atom.max()
-        self.capacity_misses.add_((capacity_excess > 0).to(torch.long))
+        overflow = capacity_excess > 0
+        self.capacity_misses.add_(overflow.to(torch.long))
+        self.window_capacity_misses.add_(overflow.to(torch.long))
+        self.window_maximum_required_by_atom.copy_(
+            torch.maximum(
+                self.window_maximum_required_by_atom,
+                num_neighbors.to(torch.long),
+            )
+        )
+        if self.overflow_to_dummy_only:
+            self.window_dummy_only_replays.add_(overflow.to(torch.long))
         self.maximum_required_neighbors.copy_(
             torch.maximum(self.maximum_required_neighbors, required_neighbors)
         )
@@ -905,11 +964,14 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
         # Keep the historical uniform expression visible for source-level
         # contracts; the vector guard is authoritative when CAPs differ.
         uniform_capacity_ok = num_neighbors.max() <= self.slots_per_atom
-        torch._assert_async(
-            vector_capacity_ok if len(set(self.neighbor_capacities)) > 1 else uniform_capacity_ok,
-            "ORBv3 Opt3 per-atom neighbor capacity exceeded; increase "
-            "whole_step_neighbors_per_atom and restart",
-        )
+        if not self.overflow_to_dummy_only:
+            torch._assert_async(
+                vector_capacity_ok
+                if len(set(self.neighbor_capacities)) > 1
+                else uniform_capacity_ok,
+                "ORBv3 Opt3 per-atom neighbor capacity exceeded; increase "
+                "whole_step_neighbors_per_atom and restart",
+            )
         senders, receivers, shifts, valid = sink_pad_neighbor_matrix(
             neighbor_matrix,
             shift_matrix.to(torch.float32),
@@ -920,6 +982,9 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
             _slot_centres=self.fixed_neighbor_builder.slot_centres,
             _selection_indices=self.fixed_neighbor_builder.selection_indices,
             _edge_capacity=self.fixed_neighbor_builder.edge_capacity,
+            force_dummy_only=(
+                overflow if self.overflow_to_dummy_only else None
+            ),
         )
         real_edges = valid.sum()
         self.min_real_edges.copy_(torch.minimum(self.min_real_edges, real_edges))
@@ -977,6 +1042,8 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
         if self.captured:
             raise RuntimeError("ORBv3 whole-step CUDA Graph was already captured")
         self._captured_positions = state.positions
+        self.state = state
+        self.integrator = integrator
 
         # Validate the sink-padded fixed builder against the released eager path
         # before replacing the state's initial force.
@@ -1032,7 +1099,13 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
         side_stream.wait_stream(current_stream)
         with torch.cuda.stream(side_stream):
             for _ in range(self.capture_warmup):
-                whole_step_in_place_(state, integrator, self, self.advance)
+                whole_step_in_place_(
+                    state,
+                    integrator,
+                    self,
+                    self.advance,
+                    self.step_counter,
+                )
         current_stream.wait_stream(side_stream)
         torch.cuda.synchronize(self.device)
         self._restore_state(state, state_snapshot)
@@ -1043,7 +1116,13 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
         started = time.perf_counter()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=side_stream):
-            whole_step_in_place_(state, integrator, self, self.advance)
+            whole_step_in_place_(
+                state,
+                integrator,
+                self,
+                self.advance,
+                self.step_counter,
+            )
         current_stream.wait_stream(side_stream)
         torch.cuda.synchronize(self.device)
         self.capture_wall_time_s = time.perf_counter() - started
@@ -1061,6 +1140,8 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
                 state.momenta,
                 state.forces,
                 state.potential_energy,
+                self.advance,
+                self.step_counter,
             )
         )
         thermostat_addresses = (
@@ -1091,6 +1172,8 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
                 state.momenta,
                 state.forces,
                 state.potential_energy,
+                self.advance,
+                self.step_counter,
             )
         )
         if thermostat_snapshot is not None:
@@ -1176,11 +1259,19 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
     def replay(self) -> None:
         if not self.captured or self.cuda_graph is None:
             raise RuntimeError("ORBv3 whole-step CUDA Graph is not captured")
-        if (
-            self.verlet_rebuild_interval
-            and self.production_replays > 0
-            and self.production_replays % self.verlet_rebuild_interval == 0
-        ):
+        if self.overflow_to_dummy_only:
+            rebuild = verlet_rebuild_due(
+                self.production_replays,
+                self.verlet_rebuild_interval,
+                includes_initial_force=True,
+            )
+        else:
+            rebuild = bool(
+                self.verlet_rebuild_interval
+                and self.production_replays > 0
+                and self.production_replays % self.verlet_rebuild_interval == 0
+            )
+        if rebuild:
             assert self._captured_positions is not None
             model_positions, image_offsets = self._wrap_positions_and_images(
                 self._captured_positions
@@ -1194,6 +1285,7 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
 
     def reset_production_stats(self) -> None:
         self.production_replays = 0
+        self.step_counter.zero_()
         self.capacity_misses.zero_()
         self.maximum_required_neighbors.zero_()
         self.maximum_capacity_excess.zero_()
@@ -1201,6 +1293,7 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
         self.max_real_edges.zero_()
         self.fixed_neighbor_builder.skin_misses.zero_()
         self.fixed_neighbor_builder.skin_rebuilds = 0
+        self.reset_window_stats()
         if self._captured_positions is not None:
             model_positions, image_offsets = self._wrap_positions_and_images(
                 self._captured_positions
@@ -1208,6 +1301,47 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
             self.fixed_neighbor_builder.initialize_skin(
                 model_positions, image_offsets
             )
+
+    def state_tensors(self) -> dict[str, torch.Tensor]:
+        assert self.state.forces is not None
+        assert self.state.potential_energy is not None
+        state = {
+            "positions": self.state.positions,
+            "momenta": self.state.momenta,
+            "forces": self.state.forces,
+            "energy": self.state.potential_energy,
+            "advance": self.advance,
+            "step_counter": self.step_counter,
+        }
+        if isinstance(self.integrator, NoseHooverChainIntegrator):
+            state["eta"] = self.integrator.eta
+            state["p_eta"] = self.integrator.p_eta
+        return state
+
+    def reset_window_stats(self) -> None:
+        self.window_capacity_misses.zero_()
+        self.window_dummy_only_replays.zero_()
+        self.window_maximum_required_by_atom.zero_()
+
+    def window_status(self) -> Rob1WindowStatus:
+        return read_rob1_window_status(
+            capacity_misses=self.window_capacity_misses,
+            overflow_dummy_only_replays=self.window_dummy_only_replays,
+            maximum_required_by_atom=self.window_maximum_required_by_atom,
+            verlet_skin_misses=self.fixed_neighbor_builder.skin_misses,
+        )
+
+    def evaluate_initial(self) -> None:
+        self.advance.zero_()
+        self.replay()
+        self.advance.fill_(1.0)
+
+    def step(self) -> None:
+        self.replay()
+
+    def release(self) -> None:
+        self.cuda_graph = None
+        self.captured = False
 
     def stats(self) -> dict[str, Any]:
         minimum = int(self.min_real_edges.item()) if self.production_replays else None
@@ -1259,6 +1393,11 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
             ),
             "cuda_graph_min_real_edges": minimum,
             "cuda_graph_max_real_edges": maximum,
+            "cuda_graph_max_padding_fraction": (
+                None
+                if minimum is None
+                else (self.edge_capacity - minimum) / self.edge_capacity
+            ),
             "cuda_graph_dummy_atoms": self.n_dummy,
             "cuda_graph_capture_warmup": self.capture_warmup,
             "cuda_graph_capture_wall_time_s": self.capture_wall_time_s,
@@ -1293,6 +1432,10 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
                 self.replay_stability_passed
                 and self.validation_energy_abs_error <= self.energy_atol
                 and self.validation_force_max_abs_error <= self.force_atol
+            ),
+            "overflow_to_dummy_only": self.overflow_to_dummy_only,
+            "overflow_dummy_only_replays": int(
+                self.window_dummy_only_replays.detach().cpu()
             ),
         }
 
@@ -1390,6 +1533,18 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         "cuda_graph_edge_capacity",
         request.options.get("graph_edge_capacity"),
     )
+    rob1_enabled = bool(request.options.get("_opt4_rob1", False))
+    shared_evaluator: OrbTorchSimEvaluator | None = None
+    if rob1_enabled:
+        shared_evaluator = OrbTorchSimEvaluator(
+            atoms,
+            request.model_path,
+            variant=variant,
+            device=device,
+            max_num_neighbors=max_num_neighbors,
+            compute_stress=False,
+            profiler=profiler,
+        )
     runner = WholeStepCUDAGraphRunner(
         atoms,
         request.model_path,
@@ -1421,53 +1576,170 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         force_atol=float(
             request.options.get("cuda_graph_force_atol_ev_per_a", 2e-4)
         ),
+        shared_evaluator=shared_evaluator,
+        initial_positions=state.positions,
     )
     runner.capture(state, integrator)
     initial_state = runner._state_snapshot(state)
     initial_thermostat = runner._thermostat_snapshot(integrator)
+    controller: Rob1Controller | None = None
+    if rob1_enabled:
+        assert shared_evaluator is not None
 
-    if config.warmup_steps:
-        runner.advance.fill_(1.0)
-        for _ in range(config.warmup_steps):
-            runner.replay()
-        torch.cuda.synchronize(device)
-        runner._restore_state(state, initial_state)
-        runner._restore_thermostat(integrator, initial_thermostat)
+        def generation_factory(
+            promoted: tuple[int, ...], snapshot: dict[str, torch.Tensor]
+        ) -> WholeStepCUDAGraphRunner:
+            recovery_state = GPUMDState(
+                positions=snapshot["positions"].clone(),
+                momenta=snapshot["momenta"].clone(),
+                forces=snapshot["forces"].clone(),
+                potential_energy=snapshot["energy"].clone(),
+            )
+            recovery_integrator = _build_integrator(request, masses)
+            generation = WholeStepCUDAGraphRunner(
+                atoms,
+                request.model_path,
+                opt4_options=request.options,
+                variant=variant,
+                device=device,
+                max_num_neighbors=max_num_neighbors,
+                profiler=profiler,
+                requested_edge_capacity=sum(promoted),
+                requested_neighbors_per_atom=max(promoted),
+                neighbor_capacities=list(promoted),
+                verlet_skin=float(request.options.get("verlet_skin", 0.0)),
+                verlet_candidate_capacity=request.options.get(
+                    "verlet_candidate_capacity"
+                ),
+                verlet_rebuild_interval=int(
+                    request.options.get("verlet_rebuild_interval", 0)
+                ),
+                per_atom_cap=True,
+                edge_margin=float(
+                    request.options.get("cuda_graph_edge_margin", 0.10)
+                ),
+                edge_step=int(
+                    request.options.get("cuda_graph_edge_step", 256)
+                ),
+                capture_warmup=int(
+                    request.options.get("cuda_graph_capture_warmup", 3)
+                ),
+                n_dummy=int(
+                    request.options.get("cuda_graph_dummy_atoms", 32)
+                ),
+                energy_atol=float(
+                    request.options.get("cuda_graph_energy_atol_ev", 2e-4)
+                ),
+                force_atol=float(
+                    request.options.get(
+                        "cuda_graph_force_atol_ev_per_a", 2e-4
+                    )
+                ),
+                shared_evaluator=shared_evaluator,
+                model_already_prepared=True,
+                initial_positions=snapshot["positions"],
+            )
+            generation.capture(recovery_state, recovery_integrator)
+            generation.production_replays = int(
+                snapshot["step_counter"].detach().cpu()
+            ) + 1
+            return generation
 
-    # Initial force follows the same timed convention as baseline/Opt1/Opt2.
-    # The first replay uses advance=0 and evaluates without changing x/p/NHC.
-    assert state.forces is not None and state.potential_energy is not None
-    state.forces.zero_()
-    state.potential_energy.zero_()
-    runner.advance.zero_()
+        controller = Rob1Controller(
+            runner,
+            generation_factory=generation_factory,
+            atomic_numbers=atoms.get_atomic_numbers(),
+            neighbor_capacities=runner.neighbor_capacities,
+        )
+        physical_initial = FixedAddressStateSnapshot(runner.state_tensors())
+        if config.warmup_steps:
+            controller.evaluate_initial()
+            warmup_done = 0
+            for boundary in transaction_boundaries(
+                config.warmup_steps,
+                window_steps=int(request.options["rob1_window_steps"]),
+                verlet_rebuild_interval=runner.verlet_rebuild_interval,
+            ):
+                controller.run_steps(boundary - warmup_done)
+                warmup_done = boundary
+        physical_initial.restore_into_(controller.generation.state_tensors())
+        runner = controller.generation
+        state = runner.state
+        integrator = runner.integrator
+        runner.reset_production_stats()
+        physical_initial.restore_into_(runner.state_tensors())
+        controller.begin_production()
+    else:
+        if config.warmup_steps:
+            runner.advance.fill_(1.0)
+            for _ in range(config.warmup_steps):
+                runner.replay()
+            torch.cuda.synchronize(device)
+            runner._restore_state(state, initial_state)
+            runner._restore_thermostat(integrator, initial_thermostat)
+
+        # Initial force follows baseline/Opt1/Opt2's timed convention.
+        assert state.forces is not None and state.potential_energy is not None
+        state.forces.zero_()
+        state.potential_energy.zero_()
+        runner.advance.zero_()
 
     observation_steps = set(config.observation_steps)
     observations = []
-    runner.reset_production_stats()
+    if controller is None:
+        runner.reset_production_stats()
     torch.cuda.reset_peak_memory_stats(device)
     torch.cuda.synchronize(device)
     profiler.start()
     started = time.perf_counter()
     with profiler.phase("initial_force"):
-        runner.replay()
-    runner.advance.fill_(1.0)
+        if controller is None:
+            runner.replay()
+            runner.advance.fill_(1.0)
+        else:
+            controller.evaluate_initial()
+            runner = controller.generation
+            state = runner.state
     if config.collect_statistics and 0 in observation_steps:
         observations.append(_record_observation(state, 0, masses))
-    for step in nvtx_steps(config.steps, device):
-        with profiler.phase("whole_step_replay"):
-            runner.replay()
-        if config.collect_statistics and step in observation_steps:
-            observations.append(_record_observation(state, step, masses))
+    if controller is None:
+        for step in nvtx_steps(config.steps, device):
+            with profiler.phase("whole_step_replay"):
+                runner.replay()
+            if config.collect_statistics and step in observation_steps:
+                observations.append(_record_observation(state, step, masses))
+    else:
+        completed = 0
+        for step in transaction_boundaries(
+            config.steps,
+            window_steps=int(request.options["rob1_window_steps"]),
+            observation_steps=(
+                config.observation_steps if config.collect_statistics else ()
+            ),
+            verlet_rebuild_interval=runner.verlet_rebuild_interval,
+        ):
+            with profiler.phase("whole_step_replay"):
+                controller.run_steps(step - completed)
+            completed = step
+            runner = controller.generation
+            state = runner.state
+            if config.collect_statistics and step in observation_steps:
+                observations.append(_record_observation(state, step, masses))
     torch.cuda.synchronize(device)
     profiler.stop()
     elapsed = time.perf_counter() - started
     peak_memory_gb = torch.cuda.max_memory_allocated(device) / 1.0e9
     _validate_final_state(state)
     expected_replays = config.steps + 1
-    if runner.production_replays != expected_replays:
+    actual_replays = (
+        runner.production_replays
+        if controller is None
+        else controller.committed_replays
+    )
+    if actual_replays != expected_replays:
         raise RuntimeError(
             "ORBv3 Opt3 production replay mismatch: "
-            f"expected={expected_replays}, actual={runner.production_replays}"
+            f"expected={expected_replays}, actual={actual_replays}"
         )
 
     final_atoms = atoms.copy()
@@ -1553,8 +1825,12 @@ def run_md(request: MDRunRequest) -> MDRunResult:
                 .to(device="cpu")
                 .tolist()
             ),
-            "capacity_overflow_policy": "device-assert-error-no-recapture-no-fallback",
-            "transaction_rollback": False,
+            "capacity_overflow_policy": (
+                "rob1-rollback-promote-recapture-no-eager-fallback"
+                if rob1_enabled
+                else "device-assert-error-no-recapture-no-fallback"
+            ),
+            "transaction_rollback": rob1_enabled,
             "graph_buckets": False,
             "dummy_padding": True,
             "sink_padding": True,
@@ -1565,7 +1841,7 @@ def run_md(request: MDRunRequest) -> MDRunResult:
             "warmup_steps": config.warmup_steps,
             "model_specific_fusion": False,
             "performance_profile": profiler.summary(synchronize=False),
-            **runner.stats(),
+            **(runner.stats() if controller is None else controller.stats()),
         },
     )
     validate_result(request, result)
