@@ -60,6 +60,7 @@ def refresh(model, options):
     for module in model.modules():
         region = getattr(module, "_opt4_receive_csr", None)
         if isinstance(region, CheckedRegion):
+            module._opt4_edge_capacity = int(edge_rows.numel())
             region.reference.edge_rows = edge_rows
             region.reference.rows = row_ptr.shape[0] - 1
             region.compiled.set_layout(row_ptr, edge_rows, max_row, one)
@@ -89,12 +90,13 @@ def install(model, passes, report, options):
             detail,
             _FixedWeightedCSR(row_ptr, edge_rows, max_row, one),
         )
+        module._opt4_edge_capacity = int(edge_rows.numel())
         modules.append(detail)
     record(
         report,
         "receive_attention_csr",
         len(modules),
-        "triton-fixed-csr-explicit-vjp",
+        "triton-fixed-csr-forward-value-vjp-aten-weight-vjp",
         modules=modules,
         fused_boundaries=["attention-value-multiply", "receiver-segment-sum"],
         sender_path="native-dynamic-segment",
@@ -102,5 +104,5 @@ def install(model, passes, report, options):
         attention_normalization="unchanged",
         edge_layout="receiver-major-directed-reenumeration",
         reverse_edge=False,
-        fusion_scope="forward-and-backward",
+        fusion_scope="forward-and-value-vjp; native-order explicit weight-vjp",
     )

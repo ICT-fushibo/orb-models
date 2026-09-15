@@ -248,7 +248,10 @@ class AttentionInteractionNetwork(nn.Module):
         sent_attributes = segment_ops.segment_sum(
             updated_edges * send_attn, senders, nodes.shape[0]
         )
-        if hasattr(self, "_opt4_receive_csr"):
+        if (
+            hasattr(self, "_opt4_receive_csr")
+            and updated_edges.shape[0] == self._opt4_edge_capacity
+        ):
             received_attributes = self._opt4_receive_csr(
                 updated_edges, receive_attn, self._opt4_receive_scale
             )
