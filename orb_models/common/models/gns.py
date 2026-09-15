@@ -240,26 +240,25 @@ class AttentionInteractionNetwork(nn.Module):
             receive_attn = receive_attn * cutoff
             send_attn = send_attn * cutoff
 
-        if getattr(self, "_opt4_gather_pack", False):
-            edge_features = self._opt4_gather_op(edges, nodes, senders, receivers)
-        else:
-            sent_attributes = nodes[senders]
-            received_attributes = nodes[receivers]
-            edge_features = torch.cat([edges, sent_attributes, received_attributes], dim=1)
+        sent_attributes = nodes[senders]
+        received_attributes = nodes[receivers]
+        edge_features = torch.cat([edges, sent_attributes, received_attributes], dim=1)
         updated_edges = self._edge_mlp(edge_features)
 
         sent_attributes = segment_ops.segment_sum(
             updated_edges * send_attn, senders, nodes.shape[0]
         )
-        received_attributes = segment_ops.segment_sum(
-            updated_edges * receive_attn, receivers, nodes.shape[0]
-        )
+        if hasattr(self, "_opt4_receive_csr"):
+            received_attributes = self._opt4_receive_csr(
+                updated_edges, receive_attn, self._opt4_receive_scale
+            )
+        else:
+            received_attributes = segment_ops.segment_sum(
+                updated_edges * receive_attn, receivers, nodes.shape[0]
+            )
 
         node_features = torch.cat([nodes, received_attributes, sent_attributes], dim=1)
-        if getattr(self, "_opt4_norm_residual", False):
-            updated_nodes = self._node_mlp.mlp(node_features)
-        else:
-            updated_nodes = self._node_mlp(node_features)
+        updated_nodes = self._node_mlp(node_features)
 
         # Remove the conditioning features, if using concatenation
         if self._node_cond == "concatenative":
@@ -267,15 +266,7 @@ class AttentionInteractionNetwork(nn.Module):
         if self._edge_cond == "concatenative":
             edges = edges[:, : self.latent_dim]
 
-        if getattr(self, "_opt4_norm_residual", False):
-            norm = self._node_mlp.layer_norm
-            weight = norm.weight if norm.weight is not None else self._opt4_norm_one
-            bias = getattr(norm, "bias", None)
-            bias = bias if bias is not None else self._opt4_norm_zero
-            eps = norm.eps if norm.eps is not None else torch.finfo(updated_nodes.dtype).eps
-            nodes = self._opt4_norm_op(updated_nodes, nodes, weight, bias, eps, isinstance(norm, nn.RMSNorm))
-        else:
-            nodes = nodes + updated_nodes
+        nodes = nodes + updated_nodes
         edges = edges + updated_edges
 
         return nodes, edges
