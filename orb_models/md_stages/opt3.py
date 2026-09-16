@@ -618,7 +618,7 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
         self.overflow_to_dummy_only = bool(
             (opt4_options or {}).get("overflow_to_dummy_only", False)
         )
-        self.opt4_receiver_major_edges = "receive_attention_csr" in set(
+        self.opt4_receiver_major_edges = "fasteq_dual_attention_pack" in set(
             (opt4_options or {}).get("_opt4_passes", ())
         )
 
