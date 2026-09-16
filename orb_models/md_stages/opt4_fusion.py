@@ -8,7 +8,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from md_benchmark.opt4_fx import CheckedRegion
+from md_benchmark.opt4_fx import CheckedRegion, assert_dot_reduction_close
 from md_benchmark.opt4_registry import FusionSetupError, fixed_csr_layout, record
 
 
@@ -44,6 +44,31 @@ class _DualAggregatePack(nn.Module):
         sent = updated_edges.new_zeros((self.rows, updated_edges.shape[-1]))
         sent.index_add_(0, senders, updated_edges * send_attn)
         return torch.cat((nodes, received, sent), dim=-1)
+
+    def validate_vjp(self, actual, expected, args, input_index, output_probes):
+        """Account for legal fp32 dot-order changes in attention VJPs.
+
+        The scalar attention gradients are width-sized dot reductions.  The
+        eager and compiled paths may use different reduction trees, so compare
+        both with the IEEE ``gamma_n`` bound instead of a global loose atol.
+        """
+
+        if input_index not in (1, 2):
+            return False
+        updated_edges, _receive_attn, _send_attn, _nodes, senders = args
+        probe = output_probes[0]
+        if probe is None:
+            raise RuntimeError("dual aggregate validation requires an output probe")
+        width = updated_edges.shape[-1]
+        if input_index == 1:
+            output_probe = probe[:, width : 2 * width].index_select(
+                0, self.edge_rows
+            )
+        else:
+            output_probe = probe[:, 2 * width :].index_select(0, senders)
+        terms = updated_edges * output_probe
+        assert_dot_reduction_close(actual, expected, terms)
+        return True
 
 
 def _layout(options, parameter):
@@ -103,8 +128,11 @@ def install(model, passes, report, options):
             _DualAttention(module._receive_attn, module._send_attn),
             attention_detail,
         )
+        aggregate = _DualAggregatePack(edge_rows, rows)
         module._opt4_fasteq_aggregate = CheckedRegion(
-            _DualAggregatePack(edge_rows, rows), aggregate_detail
+            aggregate,
+            aggregate_detail,
+            vjp_validator=aggregate.validate_vjp,
         )
         module._opt4_edge_capacity = int(edge_rows.numel())
         modules.append(detail)
