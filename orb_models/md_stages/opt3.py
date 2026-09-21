@@ -618,10 +618,6 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
         self.overflow_to_dummy_only = bool(
             (opt4_options or {}).get("overflow_to_dummy_only", False)
         )
-        self.opt4_receiver_major_edges = "fasteq_dual_attention_pack" in set(
-            (opt4_options or {}).get("_opt4_passes", ())
-        )
-
         self.sim_state.positions = (
             self.sim_state.positions
             if initial_positions is None
@@ -1002,12 +998,6 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
         positions_with_sinks = torch.cat(
             (model_positions, model_positions.new_zeros((self.n_dummy, 3))), dim=0
         )
-        if self.opt4_receiver_major_edges:
-            # The radius graph contains both directed orientations.  Reversing
-            # its enumeration makes the fixed centre slots receiver-major;
-            # negating the PBC shift preserves the reversed physical vector.
-            # No sorting or host work is introduced in capture/replay.
-            senders, receivers, shifts = receivers, senders, -shifts
         return positions_with_sinks, senders, receivers, shifts
 
     def __call__(self, positions: torch.Tensor):

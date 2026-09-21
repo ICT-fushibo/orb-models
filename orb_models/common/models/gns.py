@@ -218,13 +218,7 @@ class AttentionInteractionNetwork(nn.Module):
         elif self._edge_cond == "concatenative" and cond_edges is not None:
             edges = torch.cat([edges, self._cond_edge_proj(cond_edges)], dim=-1)
 
-        fasteq_boundary = (
-            hasattr(self, "_opt4_fasteq_attention")
-            and edges.shape[0] == self._opt4_edge_capacity
-        )
-        if fasteq_boundary:
-            receive_attn, send_attn = self._opt4_fasteq_attention(edges, cutoff)
-        elif self._attention_gate == "softmax":
+        if self._attention_gate == "softmax":
             num_segments = nodes.shape[0]
             receive_attn = segment_ops.segment_softmax(
                 self._receive_attn(edges),
@@ -242,29 +236,35 @@ class AttentionInteractionNetwork(nn.Module):
             receive_attn = F.sigmoid(self._receive_attn(edges))
             send_attn = F.sigmoid(self._send_attn(edges))
 
-        if self._distance_cutoff and not fasteq_boundary:
+        if self._distance_cutoff:
             receive_attn = receive_attn * cutoff
             send_attn = send_attn * cutoff
 
-        sent_attributes = nodes[senders]
-        received_attributes = nodes[receivers]
-        edge_features = torch.cat([edges, sent_attributes, received_attributes], dim=1)
-        updated_edges = self._edge_mlp(edge_features)
-
-        if fasteq_boundary:
-            node_features = self._opt4_fasteq_aggregate(
-                updated_edges, receive_attn, send_attn, nodes, senders
+        fasteq_edge_pack = (
+            hasattr(self, "_opt4_fasteq_edge_pack")
+            and edges.shape[0] == self._opt4_edge_capacity
+        )
+        if fasteq_edge_pack:
+            edge_features = self._opt4_fasteq_edge_pack(
+                edges, nodes, senders, receivers
             )
         else:
-            sent_attributes = segment_ops.segment_sum(
-                updated_edges * send_attn, senders, nodes.shape[0]
+            sent_attributes = nodes[senders]
+            received_attributes = nodes[receivers]
+            edge_features = torch.cat(
+                [edges, sent_attributes, received_attributes], dim=1
             )
-            received_attributes = segment_ops.segment_sum(
-                updated_edges * receive_attn, receivers, nodes.shape[0]
-            )
-            node_features = torch.cat(
-                [nodes, received_attributes, sent_attributes], dim=1
-            )
+        updated_edges = self._edge_mlp(edge_features)
+
+        sent_attributes = segment_ops.segment_sum(
+            updated_edges * send_attn, senders, nodes.shape[0]
+        )
+        received_attributes = segment_ops.segment_sum(
+            updated_edges * receive_attn, receivers, nodes.shape[0]
+        )
+        node_features = torch.cat(
+            [nodes, received_attributes, sent_attributes], dim=1
+        )
         updated_nodes = self._node_mlp(node_features)
 
         # Remove the conditioning features, if using concatenation
