@@ -204,14 +204,6 @@ class AttentionInteractionNetwork(nn.Module):
         Returns:
             Tuple of (updated_nodes, updated_edges)
         """
-        processor_aot = getattr(self, "_opt4_fasteq_processor_aot", None)
-        if processor_aot is not None:
-            if cond_nodes is not None or cond_edges is not None:
-                raise RuntimeError(
-                    "ORBv3 Opt4 processor AOT received unsupported conditioning"
-                )
-            return processor_aot(nodes, edges, senders, receivers, cutoff)
-
         # Condition on nodes
         if self._node_cond == "additive":
             if cond_nodes is not None:
@@ -506,16 +498,30 @@ class MoleculeGNS(base.ModelMixin):
 
         # Process through interaction networks
         cutoff = get_cutoff(batch.edge_features["vectors"].norm(dim=-1))
-        for gnn in self.gnn_stacks:
-            nodes, edges = gnn(
+        processor_aot = getattr(self, "_opt4_fasteq_processor_aot", None)
+        if processor_aot is not None:
+            if cond_nodes is not None or cond_edges is not None:
+                raise RuntimeError(
+                    "ORBv3 Opt4 processor AOT received unsupported conditioning"
+                )
+            nodes, edges = processor_aot(
                 nodes,
                 edges,
                 batch.senders,
                 batch.receivers,
                 cutoff,
-                cond_nodes=cond_nodes,
-                cond_edges=cond_edges,
             )
+        else:
+            for gnn in self.gnn_stacks:
+                nodes, edges = gnn(
+                    nodes,
+                    edges,
+                    batch.senders,
+                    batch.receivers,
+                    cutoff,
+                    cond_nodes=cond_nodes,
+                    cond_edges=cond_edges,
+                )
 
         # Decode
         pred = self._decoder(nodes)

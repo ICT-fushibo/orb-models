@@ -60,6 +60,21 @@ class _GNSProcessorBlockReference(nn.Module):
         return nodes + updated_nodes, edges + updated_edges
 
 
+class _GNSProcessorReference(nn.Module):
+    """All message-passing blocks in one shape-specialized AOT region."""
+
+    def __init__(self, processor: nn.Module) -> None:
+        super().__init__()
+        self.blocks = nn.ModuleList(
+            [_GNSProcessorBlockReference(block) for block in processor.gnn_stacks]
+        )
+
+    def forward(self, nodes, edges, senders, receivers, cutoff):
+        for block in self.blocks:
+            nodes, edges = block(nodes, edges, senders, receivers, cutoff)
+        return nodes, edges
+
+
 def refresh(model, options) -> None:
     """Force validation/compilation of a promoted CAP shape before capture."""
 
@@ -87,26 +102,32 @@ def install(model, passes, report, options):
     # Materialise the list before installing children that share checkpoint
     # submodules; this prevents traversal of the just-created AOT wrappers.
     for path, module in list(model.named_modules()):
-        if type(module).__name__ != "AttentionInteractionNetwork":
+        if type(module).__name__ != "MoleculeGNS":
             continue
-        if module._node_cond != "none" or module._edge_cond != "none":
+        if module.conditioner is not None:
             raise FusionSetupError(
-                "ORBv3 processor AOT does not support conditioned blocks"
+                "ORBv3 processor AOT does not support conditioned processors"
             )
-        if module._attention_gate != "sigmoid":
-            raise FusionSetupError(
-                "ORBv3 processor AOT currently supports sigmoid attention only"
-            )
+        for block in module.gnn_stacks:
+            if block._node_cond != "none" or block._edge_cond != "none":
+                raise FusionSetupError(
+                    "ORBv3 processor AOT does not support conditioned blocks"
+                )
+            if block._attention_gate != "sigmoid":
+                raise FusionSetupError(
+                    "ORBv3 processor AOT supports sigmoid attention only"
+                )
         if hasattr(module, "_opt4_fasteq_processor_aot"):
             raise FusionSetupError("ORBv3 processor AOT was installed more than once")
 
         detail = {
             "module": path,
-            "boundary": "complete-attention-interaction-network",
+            "boundary": "complete-gns-message-passing-processor",
+            "message_passing_blocks": len(module.gnn_stacks),
             "validated_shapes": 0,
             "benchmark_requested": report.get("benchmark_boundaries", False),
         }
-        reference = _GNSProcessorBlockReference(module)
+        reference = _GNSProcessorReference(module)
         module._opt4_fasteq_processor_aot = CheckedRegion(reference, detail)
         modules.append(detail)
 
@@ -123,6 +144,7 @@ def install(model, passes, report, options):
             "dual-weighted-segment-reduction",
             "node-mlp-input-pack-pointwise-and-normalization",
             "node-edge-residual",
+            "cross-block-intermediate-lifetime",
         ],
         edge_order="native-dynamic-directed",
         gemm="native-orb-linear-external-calls",
