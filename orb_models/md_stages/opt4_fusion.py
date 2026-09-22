@@ -1,69 +1,77 @@
-"""FastEq-inspired edge gather/pack boundary for ORBv3 Opt4.
+"""FastEq-inspired, full ORB GNS processor-block AOT boundary.
 
-Algorithmic adaptation of FastEq commit 40ba40e72bee769d74a869bb4a4ba820ee1c55c0
-(MIT); the integration repository carries the complete third-party notice.
+The design follows the operator-coarsening principle used by FastEq commit
+40ba40e72bee769d74a869bb4a4ba820ee1c55c0 (MIT): compile a sufficiently
+large equivariant/message-passing region so that pointwise, layout and
+reduction intermediates can be eliminated, while leaving dense GEMMs to the
+vendor library. FastEq is a design source, not a runtime dependency.
 """
 from __future__ import annotations
 
 import torch
 from torch import nn
 
-from md_benchmark.opt4_fx import CheckedRegion, assert_associative_sum_close
-from md_benchmark.opt4_registry import FusionSetupError, fixed_csr_layout, record
+from md_benchmark.opt4_fx import CheckedRegion
+from md_benchmark.opt4_registry import FusionSetupError, record
+from orb_models.common.models import segment_ops
 
 
-class _EdgeGatherPackReference(nn.Module):
-    """Native ORB edge-MLP input boundary used as the validation oracle."""
+class _GNSProcessorBlockReference(nn.Module):
+    """Exact inference graph for one native ``AttentionInteractionNetwork``.
 
-    def forward(self, edges, nodes, senders, receivers):
-        return torch.cat(
-            (edges, nodes.index_select(0, senders), nodes.index_select(0, receivers)),
+    The referenced Linear/MLP modules are shared with the checkpoint. They are
+    registered here only so Dynamo treats their parameters as module inputs;
+    no parameter is copied or rewritten.
+    """
+
+    def __init__(self, block: nn.Module) -> None:
+        super().__init__()
+        self.receive_attn = block._receive_attn
+        self.send_attn = block._send_attn
+        self.edge_mlp = block._edge_mlp
+        self.node_mlp = block._node_mlp
+        self.distance_cutoff = bool(block._distance_cutoff)
+
+    def forward(self, nodes, edges, senders, receivers, cutoff):
+        receive_attn = torch.sigmoid(self.receive_attn(edges))
+        send_attn = torch.sigmoid(self.send_attn(edges))
+        if self.distance_cutoff:
+            receive_attn = receive_attn * cutoff
+            send_attn = send_attn * cutoff
+
+        edge_features = torch.cat(
+            (
+                edges,
+                nodes.index_select(0, senders),
+                nodes.index_select(0, receivers),
+            ),
             dim=-1,
         )
-
-    def validate_vjp(self, actual, expected, args, input_index, output_probes):
-        """Allow only legal fp32 reassociation in the node gather VJP."""
-
-        if input_index != 1:
-            return False
-        edges, _nodes, senders, receivers = args
-        probe = output_probes[0]
-        if probe is None:
-            raise RuntimeError("edge gather/pack validation requires an output probe")
-        width = int(edges.shape[-1])
-        values = torch.cat(
-            (probe[:, width : 2 * width], probe[:, 2 * width :]), dim=0
+        updated_edges = self.edge_mlp(edge_features)
+        sent_attributes = segment_ops.segment_sum(
+            updated_edges * send_attn, senders, nodes.shape[0]
         )
-        rows = torch.cat((senders, receivers), dim=0)
-        counts = torch.bincount(rows, minlength=actual.shape[0])
-        max_terms = max(1, int(counts.max().item()))
-        assert_associative_sum_close(
-            actual,
-            expected,
-            values,
-            rows,
-            int(actual.shape[0]),
-            max_terms,
+        received_attributes = segment_ops.segment_sum(
+            updated_edges * receive_attn, receivers, nodes.shape[0]
         )
-        return True
+        updated_nodes = self.node_mlp(
+            torch.cat((nodes, received_attributes, sent_attributes), dim=-1)
+        )
+        return nodes + updated_nodes, edges + updated_edges
 
 
 def refresh(model, options) -> None:
-    """Invalidate setup signatures after a CAP promotion/Graph generation."""
+    """Force validation/compilation of a promoted CAP shape before capture."""
 
-    parameter = next(model.parameters())
-    row_ptr, _edge_rows, max_row = fixed_csr_layout(options, parameter)
-    edge_capacity = int(sum(options["neighbor_capacities"]))
+    del options
     for module in model.modules():
-        boundary = getattr(module, "_opt4_fasteq_edge_pack", None)
+        boundary = getattr(module, "_opt4_fasteq_processor_aot", None)
         if isinstance(boundary, CheckedRegion):
-            module._opt4_edge_capacity = edge_capacity
-            boundary.compiled.set_layout(row_ptr, max_row)
             boundary.signatures.clear()
 
 
 def install(model, passes, report, options):
-    if "fasteq_edge_gather_pack_vjp" not in passes:
+    if "fasteq_gns_processor_aot_vjp" not in passes:
         return
     capacities = options.get("neighbor_capacities")
     if (
@@ -72,53 +80,54 @@ def install(model, passes, report, options):
         or any(type(value) is not int or value < 1 for value in capacities)
     ):
         raise FusionSetupError(
-            "ORBv3 edge gather/pack requires probe-derived neighbor capacities"
+            "ORBv3 processor AOT requires probe-derived neighbor capacities"
         )
-    parameter = next(model.parameters())
-    row_ptr, _edge_rows, max_row = fixed_csr_layout(options, parameter)
-    edge_capacity = int(sum(capacities))
-
-    # Importing this module imports Triton. Keep that dependency scoped to an
-    # explicitly requested Opt4 pass so baseline/Opt1--Opt3 imports are intact.
-    from .opt4_gather_pack import FastEqEdgeGatherPack
 
     modules = []
+    # Materialise the list before installing children that share checkpoint
+    # submodules; this prevents traversal of the just-created AOT wrappers.
     for path, module in list(model.named_modules()):
         if type(module).__name__ != "AttentionInteractionNetwork":
             continue
         if module._node_cond != "none" or module._edge_cond != "none":
             raise FusionSetupError(
-                "ORBv3 FastEq gather/pack does not support conditioned blocks"
+                "ORBv3 processor AOT does not support conditioned blocks"
             )
+        if module._attention_gate != "sigmoid":
+            raise FusionSetupError(
+                "ORBv3 processor AOT currently supports sigmoid attention only"
+            )
+        if hasattr(module, "_opt4_fasteq_processor_aot"):
+            raise FusionSetupError("ORBv3 processor AOT was installed more than once")
+
         detail = {
             "module": path,
-            "boundary": "edge-node-gather-pack",
+            "boundary": "complete-attention-interaction-network",
             "validated_shapes": 0,
             "benchmark_requested": report.get("benchmark_boundaries", False),
         }
-        reference = _EdgeGatherPackReference()
-        module._opt4_fasteq_edge_pack = CheckedRegion(
-            reference,
-            detail,
-            candidate=FastEqEdgeGatherPack(row_ptr, max_row),
-            vjp_validator=reference.validate_vjp,
-        )
-        module._opt4_edge_capacity = edge_capacity
+        reference = _GNSProcessorBlockReference(module)
+        module._opt4_fasteq_processor_aot = CheckedRegion(reference, detail)
         modules.append(detail)
+
     record(
         report,
-        "fasteq_edge_gather_pack_vjp",
+        "fasteq_gns_processor_aot_vjp",
         len(modules),
-        "triton-edge-gather-pack-explicit-vjp",
+        "torch-inductor-fullgraph-forward-vjp",
         modules=modules,
         fused_boundaries=[
-            "sender-node-gather",
-            "receiver-node-gather",
-            "edge-mlp-input-pack",
-            "dual-indexing-backward",
+            "dual-attention-sigmoid-cutoff",
+            "sender-receiver-gather-pack",
+            "edge-mlp-pointwise-and-normalization",
+            "dual-weighted-segment-reduction",
+            "node-mlp-input-pack-pointwise-and-normalization",
+            "node-edge-residual",
         ],
         edge_order="native-dynamic-directed",
-        gemm="original-orb-mlp",
-        backward="explicit-edge-copy-receiver-atomic-sender-csr-vjp",
+        gemm="native-orb-linear-external-calls",
+        backward="inductor-aot-complete-first-order-vjp",
+        internal_cuda_graph=False,
         replay_runtime_compile=False,
+        shape_specialization="node-count-edge-capacity-dtype-stride",
     )

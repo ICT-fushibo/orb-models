@@ -204,6 +204,14 @@ class AttentionInteractionNetwork(nn.Module):
         Returns:
             Tuple of (updated_nodes, updated_edges)
         """
+        processor_aot = getattr(self, "_opt4_fasteq_processor_aot", None)
+        if processor_aot is not None:
+            if cond_nodes is not None or cond_edges is not None:
+                raise RuntimeError(
+                    "ORBv3 Opt4 processor AOT received unsupported conditioning"
+                )
+            return processor_aot(nodes, edges, senders, receivers, cutoff)
+
         # Condition on nodes
         if self._node_cond == "additive":
             if cond_nodes is not None:
@@ -240,20 +248,11 @@ class AttentionInteractionNetwork(nn.Module):
             receive_attn = receive_attn * cutoff
             send_attn = send_attn * cutoff
 
-        fasteq_edge_pack = (
-            hasattr(self, "_opt4_fasteq_edge_pack")
-            and edges.shape[0] == self._opt4_edge_capacity
+        sent_attributes = nodes[senders]
+        received_attributes = nodes[receivers]
+        edge_features = torch.cat(
+            [edges, sent_attributes, received_attributes], dim=1
         )
-        if fasteq_edge_pack:
-            edge_features = self._opt4_fasteq_edge_pack(
-                edges, nodes, senders, receivers
-            )
-        else:
-            sent_attributes = nodes[senders]
-            received_attributes = nodes[receivers]
-            edge_features = torch.cat(
-                [edges, sent_attributes, received_attributes], dim=1
-            )
         updated_edges = self._edge_mlp(edge_features)
 
         sent_attributes = segment_ops.segment_sum(
