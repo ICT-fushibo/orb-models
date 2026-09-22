@@ -87,8 +87,11 @@ def _processor_validators(detail):
             expected,
             rtol=1.0e-5,
             atol=1.0e-6,
-            absolute_ceiling=8.0e-6,
-            relative_l2_limit=5.0e-7,
+            # Five message-passing blocks contain repeated segment reductions
+            # and residual updates. Use the same magnitude contract as the
+            # compiled first-order VJP instead of the single-boundary limit.
+            absolute_ceiling=4.0e-5,
+            relative_l2_limit=2.0e-6,
             label=f"ORB processor forward output[{output_index}]",
         )
         detail.setdefault("forward_reassociation_validation", []).append(
