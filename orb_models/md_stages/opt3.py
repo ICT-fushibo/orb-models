@@ -16,6 +16,7 @@ import warnings
 from pathlib import Path
 from typing import Any
 
+import ase.io
 import numpy as np
 import torch
 from ase import units
@@ -66,6 +67,7 @@ from orb_models.md_stages.opt1 import (
     _configure_precision,
     _distribution_version,
     _record_observation,
+    _snapshot,
     _validate_final_state,
 )
 from orb_models.md_stages.opt2 import (
@@ -1462,10 +1464,10 @@ def _validate_request(request: MDRunRequest) -> tuple[str, int | None]:
         raise NotImplementedError("ORBv3 Opt3 does not support ASE constraints")
     if len(request.atoms) < 2:
         raise ValueError("NVT MD requires at least two atoms")
-    if request.config.collect_trajectory or request.output_path is not None:
-        raise NotImplementedError("ORBv3 Opt3 currently captures force-only MD, not stress")
-    if bool(_option(request.options, "compute_stress", False)):
-        raise NotImplementedError("ORBv3 Opt3 does not capture stress")
+    if bool(_option(request.options, "compute_stress", False)) and not request.config.collect_trajectory:
+        raise NotImplementedError(
+            "ORBv3 Opt3 computes stress only at trajectory record boundaries"
+        )
     if os.environ.get("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE") == "1":
         raise RuntimeError("ORBv3 Opt3 forbids TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1")
     forbidden_options = [
@@ -1515,6 +1517,27 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         device = torch.device("cuda", torch.cuda.current_device())
     config = request.config
     atoms = request.atoms.copy()
+    trajectory_path = (
+        Path(request.output_path).expanduser().resolve()
+        if request.output_path is not None
+        else None
+    )
+    partial_path = (
+        trajectory_path.with_name(f"{trajectory_path.stem}.part.extxyz")
+        if trajectory_path is not None
+        else None
+    )
+    if config.collect_trajectory and config.record_interval < 1:
+        raise ValueError("collect_trajectory requires record_interval >= 1")
+    if trajectory_path is not None:
+        if not config.collect_trajectory:
+            raise ValueError("ORBv3 output_path requires collect_trajectory=True")
+        trajectory_path.parent.mkdir(parents=True, exist_ok=True)
+        if trajectory_path.exists() and not request.options.get("overwrite", False):
+            raise FileExistsError(f"Refusing to overwrite {trajectory_path}")
+        for stale in (trajectory_path, partial_path):
+            if stale is not None and stale.exists():
+                stale.unlink()
     MaxwellBoltzmannDistribution(
         atoms,
         temperature_K=config.temperature_k,
@@ -1534,6 +1557,19 @@ def run_md(request: MDRunRequest) -> MDRunResult:
     integrator = _build_integrator(request, masses)
     profiler = CudaPhaseProfiler(
         enabled=performance_profile_requested(request.options), device=device, prefix="opt3"
+    )
+    stress_evaluator = (
+        OrbTorchSimEvaluator(
+            atoms,
+            request.model_path,
+            variant=variant,
+            device=device,
+            max_num_neighbors=max_num_neighbors,
+            compute_stress=True,
+            profiler=profiler,
+        )
+        if config.collect_trajectory
+        else None
     )
     requested_capacity = request.options.get(
         "cuda_graph_edge_capacity",
@@ -1692,6 +1728,9 @@ def run_md(request: MDRunRequest) -> MDRunResult:
 
     observation_steps = set(config.observation_steps)
     observations = []
+    in_memory_trajectory = (
+        [] if config.collect_trajectory and trajectory_path is None else None
+    )
     if controller is None:
         runner.reset_production_stats()
     torch.cuda.reset_peak_memory_stats(device)
@@ -1706,6 +1745,29 @@ def run_md(request: MDRunRequest) -> MDRunResult:
             controller.evaluate_initial()
             runner = controller.generation
             state = runner.state
+
+    def record_frame(step: int) -> None:
+        if stress_evaluator is None:
+            raise RuntimeError("ORBv3 trajectory stress evaluator is missing")
+        _forces, _energy, stress = stress_evaluator(state.positions)
+        if stress is None:
+            raise RuntimeError("ORBv3 trajectory evaluator returned no stress")
+        frame_state = GPUMDState(
+            positions=state.positions,
+            momenta=state.momenta,
+            forces=state.forces,
+            potential_energy=state.potential_energy,
+            stress=stress,
+        )
+        frame = _snapshot(atoms, frame_state, step=step, require_stress=True)
+        if partial_path is not None:
+            ase.io.write(partial_path, frame, append=True, format="extxyz")
+        else:
+            assert in_memory_trajectory is not None
+            in_memory_trajectory.append(frame)
+
+    if config.collect_trajectory:
+        record_frame(0)
     if config.collect_statistics and 0 in observation_steps:
         observations.append(_record_observation(state, 0, masses))
     if controller is None:
@@ -1714,6 +1776,8 @@ def run_md(request: MDRunRequest) -> MDRunResult:
                 runner.replay()
             if config.collect_statistics and step in observation_steps:
                 observations.append(_record_observation(state, step, masses))
+            if config.collect_trajectory and step % config.record_interval == 0:
+                record_frame(step)
     else:
         completed = 0
         for step in transaction_boundaries(
@@ -1721,6 +1785,9 @@ def run_md(request: MDRunRequest) -> MDRunResult:
             window_steps=int(request.options["rob1_window_steps"]),
             observation_steps=(
                 config.observation_steps if config.collect_statistics else ()
+            ),
+            record_interval=(
+                config.record_interval if config.collect_trajectory else 0
             ),
             verlet_rebuild_interval=runner.verlet_rebuild_interval,
         ):
@@ -1731,9 +1798,14 @@ def run_md(request: MDRunRequest) -> MDRunResult:
             state = runner.state
             if config.collect_statistics and step in observation_steps:
                 observations.append(_record_observation(state, step, masses))
+            if config.collect_trajectory and step % config.record_interval == 0:
+                record_frame(step)
     torch.cuda.synchronize(device)
     profiler.stop()
     elapsed = time.perf_counter() - started
+    if trajectory_path is not None:
+        assert partial_path is not None
+        os.replace(partial_path, trajectory_path)
     peak_memory_gb = torch.cuda.max_memory_allocated(device) / 1.0e9
     _validate_final_state(state)
     expected_replays = config.steps + 1
@@ -1759,6 +1831,10 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         peak_cuda_memory_gb=peak_memory_gb,
         final_atoms=final_atoms,
         observations=observations,
+        trajectory=in_memory_trajectory,
+        trajectory_path=(
+            str(trajectory_path) if trajectory_path is not None else None
+        ),
         metadata={
             "engine": "torch-sim-orb-gpu-resident-whole-step-cuda-graph",
             "backend": "whole-step-cuda-graph",
@@ -1840,7 +1916,13 @@ def run_md(request: MDRunRequest) -> MDRunResult:
             "graph_buckets": False,
             "dummy_padding": True,
             "sink_padding": True,
-            "compute_stress": False,
+            "compute_stress": config.collect_trajectory,
+            "trajectory_stress_backend": (
+                "eager-record-boundary-same-checkpoint"
+                if config.collect_trajectory
+                else None
+            ),
+            "trajectory_stress_cost_in_elapsed": config.collect_trajectory,
             "edge_method": "knn_alchemi",
             "max_num_neighbors": runner.max_num_neighbors,
             "integrator": config.integrator,

@@ -22,7 +22,11 @@ from orb_models.md_stages.opt3 import (
 )
 
 
-def _request(*, backend: str = "whole-step-cuda-graph") -> MDRunRequest:
+def _request(
+    *,
+    backend: str = "whole-step-cuda-graph",
+    collect_trajectory: bool = False,
+) -> MDRunRequest:
     return MDRunRequest(
         model="orbv3",
         stage="opt3",
@@ -38,6 +42,8 @@ def _request(*, backend: str = "whole-step-cuda-graph") -> MDRunRequest:
             dtype="float64",
             steps=1,
             observation_steps=(1,),
+            collect_trajectory=collect_trajectory,
+            record_interval=1 if collect_trajectory else 0,
         ),
         backend=backend,
         options={
@@ -70,6 +76,14 @@ def test_opt3_route_dispatches_without_loading_model(monkeypatch):
 def test_opt3_rejects_non_whole_step_backend_before_loading_model():
     with pytest.raises(ValueError, match="whole-step-cuda-graph"):
         _validate_request(_request(backend="model-only-cuda-graph"))
+
+
+def test_opt3_accepts_record_boundary_stress_trajectory():
+    variant, max_num_neighbors = _validate_request(
+        _request(collect_trajectory=True)
+    )
+    assert variant == "orb-v3-conservative-inf-mpa"
+    assert max_num_neighbors is None
 
 
 def test_sink_padding_is_fixed_shape_far_shifted_and_distributed():
