@@ -123,7 +123,7 @@ def refresh(model, options) -> None:
 
 
 def install(model, passes, report, options):
-    if "fasteq_gns_processor_aot_vjp" not in passes:
+    if "fasteq_gns_processor_forward_native_vjp" not in passes:
         return
     capacities = options.get("neighbor_capacities")
     if (
@@ -159,7 +159,7 @@ def install(model, passes, report, options):
 
         detail = {
             "module": path,
-            "boundary": "complete-gns-message-passing-processor",
+            "boundary": "complete-gns-processor-forward-native-vjp",
             "message_passing_blocks": len(module.gnn_stacks),
             "validated_shapes": 0,
             "benchmark_requested": report.get("benchmark_boundaries", False),
@@ -169,6 +169,7 @@ def install(model, passes, report, options):
         module._opt4_fasteq_processor_aot = CheckedRegion(
             reference,
             detail,
+            backward_policy="aten",
             output_validator=output_validator,
             vjp_validator=vjp_validator,
         )
@@ -176,9 +177,9 @@ def install(model, passes, report, options):
 
     record(
         report,
-        "fasteq_gns_processor_aot_vjp",
+        "fasteq_gns_processor_forward_native_vjp",
         len(modules),
-        "torch-inductor-fullgraph-forward-vjp",
+        "torch-inductor-fullgraph-forward-native-aten-vjp",
         modules=modules,
         fused_boundaries=[
             "dual-attention-sigmoid-cutoff",
@@ -191,7 +192,7 @@ def install(model, passes, report, options):
         ],
         edge_order="native-dynamic-directed",
         gemm="native-orb-linear-external-calls",
-        backward="inductor-aot-complete-first-order-vjp",
+        backward="aot-autograd-native-aten-first-order-vjp",
         internal_cuda_graph=False,
         replay_runtime_compile=False,
         shape_specialization="node-count-edge-capacity-dtype-stride",
