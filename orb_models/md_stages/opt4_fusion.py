@@ -11,7 +11,10 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from md_benchmark.opt4_fx import CheckedRegion
+from md_benchmark.opt4_fx import (
+    CheckedRegion,
+    assert_float32_vjp_reassociation_close,
+)
 from md_benchmark.opt4_registry import FusionSetupError, record
 from orb_models.common.models import segment_ops
 
@@ -75,6 +78,37 @@ class _GNSProcessorReference(nn.Module):
         return nodes, edges
 
 
+def _processor_validators(detail):
+    """Bound compiler reassociation error without weakening Graph parity."""
+
+    def validate_output(actual, expected, _args, output_index):
+        metrics = assert_float32_vjp_reassociation_close(
+            actual,
+            expected,
+            rtol=1.0e-5,
+            atol=1.0e-6,
+            absolute_ceiling=8.0e-6,
+            relative_l2_limit=5.0e-7,
+            label=f"ORB processor forward output[{output_index}]",
+        )
+        detail.setdefault("forward_reassociation_validation", []).append(
+            {"output_index": int(output_index), **metrics}
+        )
+
+    def validate_vjp(actual, expected, _args, input_index, _output_probes):
+        metrics = assert_float32_vjp_reassociation_close(
+            actual,
+            expected,
+            label=f"ORB processor VJP input[{input_index}]",
+        )
+        detail.setdefault("vjp_reassociation_validation", []).append(
+            {"input_index": int(input_index), **metrics}
+        )
+        return True
+
+    return validate_output, validate_vjp
+
+
 def refresh(model, options) -> None:
     """Force validation/compilation of a promoted CAP shape before capture."""
 
@@ -128,7 +162,13 @@ def install(model, passes, report, options):
             "benchmark_requested": report.get("benchmark_boundaries", False),
         }
         reference = _GNSProcessorReference(module)
-        module._opt4_fasteq_processor_aot = CheckedRegion(reference, detail)
+        output_validator, vjp_validator = _processor_validators(detail)
+        module._opt4_fasteq_processor_aot = CheckedRegion(
+            reference,
+            detail,
+            output_validator=output_validator,
+            vjp_validator=vjp_validator,
+        )
         modules.append(detail)
 
     record(
