@@ -8,6 +8,15 @@ from orb_models.md_stages.opt4_edge_preproject import (
 
 
 class EdgePreprojectionContracts(unittest.TestCase):
+    def test_setup_audit_checks_native_and_candidate(self):
+        from orb_models.md_stages.opt4_preproject_validation import validate_preproject_output
+        n, e, s = torch.zeros(3, 2), torch.zeros(5, 2), torch.zeros(5, dtype=torch.long)
+        args = n, e, s, s, torch.zeros(4, 6), torch.zeros(4)
+        ref = EdgeLinearReference()(*args)
+        self.assertEqual(validate_preproject_output(ref, ref, args)["status"], "passed")
+        with self.assertRaises(AssertionError):
+            validate_preproject_output(ref + .01, ref + .01, args)
+
     def test_linear_chain_rule_and_duplicate_neighbors(self):
         torch.manual_seed(26)
         nodes = torch.randn(3, 2, dtype=torch.float64, requires_grad=True)

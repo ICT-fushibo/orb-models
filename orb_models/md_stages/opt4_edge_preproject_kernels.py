@@ -22,7 +22,13 @@ def _gather_silu(PE, PS, PR, S, R, BIAS, Y, Z,
     z = z + tl.load(PS + sender * PS0 + channel * PS1, valid, other=0)
     z = z + tl.load(PR + receiver * PR0 + channel * PR1, valid, other=0)
     z = z + tl.load(BIAS + channel * BS, valid, other=0)
-    y = z / (1.0 + libdevice.exp(-z))
+    denominator = 1.0 + libdevice.exp(-z)
+    if z.dtype == tl.float32:
+        # Triton's '/' may lower to reciprocal-based approximate division.
+        # Keep the native SiLU exp/div formula, with explicit IEEE FP32 divide.
+        y = tl.div_rn(z, denominator)
+    else:
+        y = z / denominator
     tl.store(Z + offsets, z, valid)
     tl.store(Y + offsets, y, valid)
 

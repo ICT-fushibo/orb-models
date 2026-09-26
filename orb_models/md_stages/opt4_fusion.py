@@ -125,6 +125,15 @@ def install(model, passes, report, options):
 
 
 class _PreprojectRegion(CheckedRegion):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, output_validator=self._validate_output, **kwargs)
+
+    def _validate_output(self, actual, expected, args, output_index):
+        from .opt4_preproject_validation import validate_preproject_output
+        audit = {"output_index": output_index}
+        self.detail.setdefault("forward_validation_audits", []).append(audit)
+        validate_preproject_output(actual, expected, args, report=audit)
+
     def _validate(self, args):
         nodes, edges, _s, _r, weight, _bias = args
         n, c = nodes.shape
@@ -177,6 +186,8 @@ def _install_preproject(model, report):
            fused_boundaries=["edge-first-linear-node-preprojection", "gather-add-bias-silu"],
            forward_custom_kernels=1, vjp_custom_kernels=0, forward_native_gemms=3,
            input_vjp_native_gemms=1,
+           activation_forward="libdevice-exp-ieee-fp32-div-rn",
+           forward_validation="setup-only-fp64-oracle-and-bounded-reassociation",
            activation_vjp="native-aten-silu-backward-on-saved-preactivation",
            parameter_vjp="explicit-native-GEMM-only-when-requested",
            node_vjp="edge-gemm-then-two-native-index-put-branches-at-latent-width",
