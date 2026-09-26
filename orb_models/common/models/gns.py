@@ -240,22 +240,31 @@ class AttentionInteractionNetwork(nn.Module):
             receive_attn = receive_attn * cutoff
             send_attn = send_attn * cutoff
 
-        sent_attributes = nodes[senders]
-        received_attributes = nodes[receivers]
-        edge_features = torch.cat(
-            [edges, sent_attributes, received_attributes], dim=1
-        )
+        edge_preproject = getattr(self, "_opt4_edge_preproject", None)
         edge_epilogue = getattr(self, "_opt4_fasteq_edge_epilogue", None)
-        if edge_epilogue is None:
-            updated_edges = self._edge_mlp(edge_features)
+        if edge_preproject is not None:
+            first = self._edge_mlp.mlp[0]
+            edge_value = edge_preproject(nodes, edges, senders, receivers, first.weight, first.bias)
+            # First Linear+SiLU already executed; all later layers stay native.
+            for index, layer in enumerate(self._edge_mlp.mlp):
+                if index >= 2:
+                    edge_value = layer(edge_value)
+            updated_edges = self._edge_mlp.layer_norm(edge_value)
             output_edges = None
         else:
-            edge_value = self._edge_mlp.mlp(edge_features)
-            updated_edges, output_edges = edge_epilogue(
-                edge_value,
-                edges,
-                self._edge_mlp.layer_norm.weight,
+            sent_attributes = nodes[senders]
+            received_attributes = nodes[receivers]
+            edge_features = torch.cat(
+                [edges, sent_attributes, received_attributes], dim=1
             )
+            if edge_epilogue is None:
+                updated_edges = self._edge_mlp(edge_features)
+                output_edges = None
+            else:
+                edge_value = self._edge_mlp.mlp(edge_features)
+                updated_edges, output_edges = edge_epilogue(
+                    edge_value, edges, self._edge_mlp.layer_norm.weight,
+                )
 
         sent_attributes = segment_ops.segment_sum(
             updated_edges * send_attn, senders, nodes.shape[0]
