@@ -1,21 +1,110 @@
-"""ORBv3 Opt4 fusion entry point.
-
-No ORB fusion candidate is currently active. The full-processor AOT attempts
-were rejected because compiler reassociation in the forward pass changed the
-force VJP beyond the frozen numerical contract on both validation systems.
-The failed implementations remain available in Git history only.
-"""
+"""ORBv3 native-forward, explicit-VJP Opt4 boundaries."""
 from __future__ import annotations
 
-from md_benchmark.opt4_registry import FusionSetupError
+import torch
+
+from md_benchmark.opt4_fx import CheckedRegion, assert_float32_vjp_reassociation_close
+from md_benchmark.opt4_registry import FusionSetupError, record
+
+
+def _rms_eps(module) -> float:
+    eps = module.eps
+    if eps is None:
+        eps = torch.finfo(module.weight.dtype).eps
+    return float(eps)
+
+
+def _vjp_validator(actual, expected, _args, _input_index, _output_probes):
+    assert_float32_vjp_reassociation_close(
+        actual,
+        expected,
+        label="ORB RMSNorm/residual VJP",
+    )
+    return True
 
 def refresh(model, options) -> None:
-    """There is no compiled ORB boundary to refresh."""
+    """Revalidate every Graph generation without reinstalling the boundary."""
 
-    del model, options
+    del options
+    for module in model.modules():
+        for name in (
+            "_opt4_fasteq_edge_epilogue",
+            "_opt4_fasteq_node_epilogue",
+        ):
+            boundary = getattr(module, name, None)
+            if isinstance(boundary, CheckedRegion):
+                boundary.signatures.clear()
 
 
 def install(model, passes, report, options):
-    del model, report, options
-    if passes:
-        raise FusionSetupError("ORBv3 has no active Opt4 fusion candidate")
+    del options
+    if "fasteq_orb_rmsnorm_residual_vjp" not in passes:
+        return
+
+    from .opt4_rmsnorm_residual import (
+        FastEqRMSNormResidual,
+        NativeRMSNormResidualReference,
+    )
+
+    modules = []
+    for path, module in list(model.named_modules()):
+        if type(module).__name__ != "AttentionInteractionNetwork":
+            continue
+        if module._node_cond != "none" or module._edge_cond != "none":
+            raise FusionSetupError(
+                "ORBv3 RMSNorm/residual VJP does not support conditioned blocks"
+            )
+        if not isinstance(module._edge_mlp.layer_norm, torch.nn.RMSNorm):
+            raise FusionSetupError("ORBv3 edge MLP does not use native RMSNorm")
+        if not isinstance(module._node_mlp.layer_norm, torch.nn.RMSNorm):
+            raise FusionSetupError("ORBv3 node MLP does not use native RMSNorm")
+        if hasattr(module, "_opt4_fasteq_edge_epilogue") or hasattr(
+            module, "_opt4_fasteq_node_epilogue"
+        ):
+            raise FusionSetupError("ORBv3 RMSNorm/residual VJP installed twice")
+
+        edge_detail = {
+            "module": path,
+            "boundary": "edge-rmsnorm-residual-native-forward-explicit-vjp",
+            "validated_shapes": 0,
+            "benchmark_requested": report.get("benchmark_boundaries", False),
+        }
+        node_detail = {
+            "module": path,
+            "boundary": "node-rmsnorm-residual-native-forward-explicit-vjp",
+            "validated_shapes": 0,
+            "benchmark_requested": report.get("benchmark_boundaries", False),
+        }
+        edge_eps = _rms_eps(module._edge_mlp.layer_norm)
+        node_eps = _rms_eps(module._node_mlp.layer_norm)
+        module._opt4_fasteq_edge_epilogue = CheckedRegion(
+            NativeRMSNormResidualReference(edge_eps, True),
+            edge_detail,
+            candidate=FastEqRMSNormResidual(edge_eps, True),
+            vjp_validator=_vjp_validator,
+        )
+        module._opt4_fasteq_node_epilogue = CheckedRegion(
+            NativeRMSNormResidualReference(node_eps, False),
+            node_detail,
+            candidate=FastEqRMSNormResidual(node_eps, False),
+            vjp_validator=_vjp_validator,
+        )
+        modules.append({"module": path, "regions": [edge_detail, node_detail]})
+
+    record(
+        report,
+        "fasteq_orb_rmsnorm_residual_vjp",
+        len(modules),
+        "native-forward-triton-rmsnorm-residual-explicit-vjp",
+        modules=modules,
+        fused_boundaries=[
+            "rmsnorm-backward-reduction",
+            "rmsnorm-input-gradient",
+            "residual-gradient-accumulation",
+        ],
+        forward="native-aten-rmsnorm-then-residual-add",
+        gemm="unchanged-native-orb-linear",
+        graph_reduction="unchanged-native-orb-segment-sum",
+        backward="single-triton-kernel-per-edge-or-node-epilogue",
+        replay_runtime_compile=False,
+    )

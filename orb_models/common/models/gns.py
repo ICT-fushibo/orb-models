@@ -245,7 +245,17 @@ class AttentionInteractionNetwork(nn.Module):
         edge_features = torch.cat(
             [edges, sent_attributes, received_attributes], dim=1
         )
-        updated_edges = self._edge_mlp(edge_features)
+        edge_epilogue = getattr(self, "_opt4_fasteq_edge_epilogue", None)
+        if edge_epilogue is None:
+            updated_edges = self._edge_mlp(edge_features)
+            output_edges = None
+        else:
+            edge_value = self._edge_mlp.mlp(edge_features)
+            updated_edges, output_edges = edge_epilogue(
+                edge_value,
+                edges,
+                self._edge_mlp.layer_norm.weight,
+            )
 
         sent_attributes = segment_ops.segment_sum(
             updated_edges * send_attn, senders, nodes.shape[0]
@@ -256,7 +266,18 @@ class AttentionInteractionNetwork(nn.Module):
         node_features = torch.cat(
             [nodes, received_attributes, sent_attributes], dim=1
         )
-        updated_nodes = self._node_mlp(node_features)
+        node_epilogue = getattr(self, "_opt4_fasteq_node_epilogue", None)
+        if node_epilogue is None:
+            updated_nodes = self._node_mlp(node_features)
+            output_nodes = None
+        else:
+            node_value = self._node_mlp.mlp(node_features)
+            output_nodes = node_epilogue(
+                node_value,
+                nodes,
+                self._node_mlp.layer_norm.weight,
+            )
+            updated_nodes = None
 
         # Remove the conditioning features, if using concatenation
         if self._node_cond == "concatenative":
@@ -264,8 +285,8 @@ class AttentionInteractionNetwork(nn.Module):
         if self._edge_cond == "concatenative":
             edges = edges[:, : self.latent_dim]
 
-        nodes = nodes + updated_nodes
-        edges = edges + updated_edges
+        nodes = nodes + updated_nodes if output_nodes is None else output_nodes
+        edges = edges + updated_edges if output_edges is None else output_edges
 
         return nodes, edges
 
