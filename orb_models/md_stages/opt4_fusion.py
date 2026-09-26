@@ -68,12 +68,14 @@ def install(model, passes, report, options):
             "boundary": "edge-rmsnorm-residual-native-forward-explicit-vjp",
             "validated_shapes": 0,
             "benchmark_requested": report.get("benchmark_boundaries", False),
+            "boundary_gate_max_ratio": {"forward": 1.05, "forward_vjp": 0.85},
         }
         node_detail = {
             "module": path,
             "boundary": "node-rmsnorm-residual-native-forward-explicit-vjp",
             "validated_shapes": 0,
             "benchmark_requested": report.get("benchmark_boundaries", False),
+            "boundary_gate_max_ratio": {"forward": 1.05, "forward_vjp": 0.85},
         }
         edge_eps = _rms_eps(module._edge_mlp.layer_norm)
         node_eps = _rms_eps(module._node_mlp.layer_norm)
