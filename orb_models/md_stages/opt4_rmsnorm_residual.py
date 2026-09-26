@@ -1,9 +1,9 @@
 """Native-forward RMSNorm/residual epilogues with an explicit Triton VJP.
 
-The forward deliberately calls PyTorch's native RMSNorm and residual add in
-the same order as ORB.  Only the first-order inference VJP is replaced.  Dense
-GEMMs, graph reductions, checkpoint parameters, and model precision are left
-unchanged.
+The forward calls the same native ATen RMSNorm as ORB, retaining its inverse
+RMS, then adds the residual in the original order. The MD input VJP is Triton;
+an optional parameter VJP uses native ATen reduction, never cross-row atomics.
+Dense GEMMs, graph reductions, checkpoint parameters and precision are unchanged.
 """
 from __future__ import annotations
 
@@ -13,6 +13,11 @@ import triton
 import triton.language as tl
 from torch import nn
 
+from .opt4_rmsnorm_native import (
+    native_rmsnorm_forward,
+    native_rmsnorm_weight_vjp,
+)
+
 
 @triton.jit
 def _rmsnorm_residual_bwd(
@@ -20,8 +25,8 @@ def _rmsnorm_residual_bwd(
     grad_sum,
     value,
     weight,
+    inverse_rms_ptr,
     grad_value,
-    grad_weight,
     grad_norm_stride_0: tl.constexpr,
     grad_norm_stride_1: tl.constexpr,
     grad_sum_stride_0: tl.constexpr,
@@ -31,10 +36,8 @@ def _rmsnorm_residual_bwd(
     grad_value_stride_0: tl.constexpr,
     grad_value_stride_1: tl.constexpr,
     weight_stride: tl.constexpr,
-    eps: tl.constexpr,
     width: tl.constexpr,
     HAS_NORM_GRAD: tl.constexpr,
-    NEED_WEIGHT_GRAD: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -61,8 +64,9 @@ def _rmsnorm_residual_bwd(
             other=0.0,
         )
 
-    mean_square = tl.sum(x * x, axis=0) / width
-    inverse_rms = tl.rsqrt(mean_square + eps)
+    # Use the exact statistic saved by native forward, including its FP32
+    # reduction order. Recomputing it here perturbs cancellation-sensitive VJPs.
+    inverse_rms = tl.load(inverse_rms_ptr + row)
     weighted = upstream * gamma
     projection = tl.sum(weighted * x, axis=0) / width
     dx = weighted * inverse_rms - x * projection * inverse_rms * inverse_rms * inverse_rms
@@ -71,13 +75,6 @@ def _rmsnorm_residual_bwd(
         dx,
         mask=valid,
     )
-
-    if NEED_WEIGHT_GRAD:
-        tl.atomic_add(
-            grad_weight + columns * weight_stride,
-            upstream * x * inverse_rms,
-            mask=valid,
-        )
 
 
 def _validate(value, residual, weight) -> tuple[int, int]:
@@ -100,7 +97,7 @@ def _validate(value, residual, weight) -> tuple[int, int]:
 
 
 def _backward(ctx, grad_norm, grad_sum, *, has_norm_grad):
-    value, weight = ctx.saved_tensors
+    value, weight, inverse_rms = ctx.saved_tensors
     rows, width = map(int, value.shape)
     grad_value = torch.empty_strided(
         value.shape,
@@ -109,7 +106,6 @@ def _backward(ctx, grad_norm, grad_sum, *, has_norm_grad):
         device=value.device,
     )
     need_weight_grad = bool(ctx.needs_input_grad[2])
-    grad_weight = torch.zeros_like(weight) if need_weight_grad else weight
     # ``grad_norm`` is unused by the node epilogue.  Passing grad_sum keeps the
     # launch ABI static while HAS_NORM_GRAD removes the load at compile time.
     if grad_norm is None:
@@ -122,8 +118,8 @@ def _backward(ctx, grad_norm, grad_sum, *, has_norm_grad):
         grad_sum,
         value,
         weight,
+        inverse_rms,
         grad_value,
-        grad_weight,
         grad_norm.stride(0),
         grad_norm.stride(1),
         grad_sum.stride(0),
@@ -133,23 +129,26 @@ def _backward(ctx, grad_norm, grad_sum, *, has_norm_grad):
         grad_value.stride(0),
         grad_value.stride(1),
         weight.stride(0),
-        ctx.eps,
         width,
         HAS_NORM_GRAD=has_norm_grad,
-        NEED_WEIGHT_GRAD=need_weight_grad,
         BLOCK=block,
     )
-    return grad_value, grad_sum, grad_weight if need_weight_grad else None, None
+    grad_weight = None
+    if need_weight_grad:
+        upstream = grad_norm + grad_sum if has_norm_grad else grad_sum
+        grad_weight = native_rmsnorm_weight_vjp(
+            upstream, value, inverse_rms, weight
+        )
+    return grad_value, grad_sum, grad_weight, None
 
 
 class _RMSNormResidualPair(torch.autograd.Function):
     @staticmethod
     def forward(ctx, value, residual, weight, eps):
         _validate(value, residual, weight)
-        normalized = F.rms_norm(value, (value.shape[-1],), weight, eps)
+        normalized, inverse_rms = native_rmsnorm_forward(value, weight, eps)
         result = residual + normalized
-        ctx.save_for_backward(value, weight)
-        ctx.eps = float(eps)
+        ctx.save_for_backward(value, weight, inverse_rms)
         return normalized, result
 
     @staticmethod
@@ -161,10 +160,9 @@ class _RMSNormResidualOnly(torch.autograd.Function):
     @staticmethod
     def forward(ctx, value, residual, weight, eps):
         _validate(value, residual, weight)
-        normalized = F.rms_norm(value, (value.shape[-1],), weight, eps)
+        normalized, inverse_rms = native_rmsnorm_forward(value, weight, eps)
         result = residual + normalized
-        ctx.save_for_backward(value, weight)
-        ctx.eps = float(eps)
+        ctx.save_for_backward(value, weight, inverse_rms)
         return result
 
     @staticmethod

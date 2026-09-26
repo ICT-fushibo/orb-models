@@ -5,6 +5,7 @@ import torch
 
 from md_benchmark.opt4_fx import CheckedRegion, assert_float32_vjp_reassociation_close
 from md_benchmark.opt4_registry import FusionSetupError, record
+from .opt4_rmsnorm_native import require_native_rmsnorm_ops
 
 
 def _rms_eps(module) -> float:
@@ -41,6 +42,7 @@ def install(model, passes, report, options):
     if "fasteq_orb_rmsnorm_residual_vjp" not in passes:
         return
 
+    require_native_rmsnorm_ops()
     from .opt4_rmsnorm_residual import (
         FastEqRMSNormResidual,
         NativeRMSNormResidualReference,
@@ -84,12 +86,14 @@ def install(model, passes, report, options):
             edge_detail,
             candidate=FastEqRMSNormResidual(edge_eps, True),
             vjp_validator=_vjp_validator,
+            validate_runtime_vjp=True,
         )
         module._opt4_fasteq_node_epilogue = CheckedRegion(
             NativeRMSNormResidualReference(node_eps, False),
             node_detail,
             candidate=FastEqRMSNormResidual(node_eps, False),
             vjp_validator=_vjp_validator,
+            validate_runtime_vjp=True,
         )
         modules.append({"module": path, "regions": [edge_detail, node_detail]})
 
@@ -108,5 +112,8 @@ def install(model, passes, report, options):
         gemm="unchanged-native-orb-linear",
         graph_reduction="unchanged-native-orb-segment-sum",
         backward="single-triton-kernel-per-edge-or-node-epilogue",
+        saved_statistics="native-aten-inverse-rms",
+        parameter_vjp="native-aten-weight-only-when-requested",
+        runtime_vjp="frozen-weight-input-and-residual-only",
         replay_runtime_compile=False,
     )

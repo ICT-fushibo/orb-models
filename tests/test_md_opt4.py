@@ -1,75 +1,55 @@
-"""CPU contract checks for the ORBv3 Opt4 route."""
+"""CPU contracts for the current ORB RMSNorm Opt4 route (no retired passes)."""
+import unittest
+import importlib.util
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
-import pytest
 import torch
 
-from orb_models.md_stages import opt4
-from orb_models.md_stages.opt4_fusion import _EdgeGatherPackReference
+from md_benchmark.opt4_registry import FusionSetupError
+from orb_models import md_stages
+from orb_models.md_stages import opt4_rmsnorm_native as native
 
 
-def test_opt4_rejects_other_route() -> None:
-    with pytest.raises(ValueError, match="ORBv3 Opt4 route"):
-        opt4.run_md(type("Request", (), {"model": "dpa4", "stage": "opt4"})())
+class NativeRMSNormContractTests(unittest.TestCase):
+    def test_opt4_rejects_other_route(self):
+        # This is a route contract, not a model/neighbour-backend import test.
+        # Load an isolated module with only its delegated runner stubbed.
+        stub = SimpleNamespace(run_md=Mock(side_effect=AssertionError("wrong route delegated")))
+        spec = importlib.util.spec_from_file_location(
+            "orb_models.md_stages._route_contract", Path(native.__file__).with_name("opt4.py")
+        )
+        opt4 = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {"orb_models.md_stages.opt3": stub}), \
+             patch.object(md_stages, "opt3", stub, create=True):
+            spec.loader.exec_module(opt4)
+        with self.assertRaisesRegex(ValueError, "ORBv3 Opt4 route"):
+            opt4.run_md(SimpleNamespace(model="dpa4", stage="opt4"))
+        stub.run_md.assert_not_called()
+
+    def test_native_forward_keeps_saved_statistic_and_weight_only_mask(self):
+        value, weight = torch.randn(3, 4), torch.randn(4)
+        output, rstd, upstream, dweight = object(), object(), object(), object()
+        fwd = Mock(return_value=(output, rstd))
+        bwd = Mock(return_value=(None, dweight))
+        aten = SimpleNamespace(
+            _fused_rms_norm=SimpleNamespace(default=fwd),
+            _fused_rms_norm_backward=SimpleNamespace(default=bwd),
+        )
+        with patch.object(native.torch.ops, "aten", aten):
+            native.require_native_rmsnorm_ops()
+            self.assertEqual(native.native_rmsnorm_forward(value, weight, 1e-5), (output, rstd))
+            self.assertIs(native.native_rmsnorm_weight_vjp(upstream, value, rstd, weight), dweight)
+        fwd.assert_called_once_with(value, [4], weight, 1e-5)
+        bwd.assert_called_once_with(upstream, value, [4], rstd, weight, [False, True])
+
+    def test_missing_native_ops_is_typed_setup_error_not_fallback(self):
+        with patch.object(native.torch.ops, "aten", SimpleNamespace()):
+            with self.assertRaisesRegex(FusionSetupError, "_fused_rms_norm"):
+                native.require_native_rmsnorm_ops()
 
 
-def test_edge_gather_pack_reference_and_node_vjp_validator() -> None:
-    boundary = _EdgeGatherPackReference()
-    edges = torch.randn(4, 8, requires_grad=True)
-    nodes = torch.randn(3, 8, requires_grad=True)
-    senders = torch.tensor([0, 0, 1, 2])
-    receivers = torch.tensor([1, 2, 2, 0])
-    got = boundary(edges, nodes, senders, receivers)
-    torch.testing.assert_close(got[:, :8], edges)
-    torch.testing.assert_close(got[:, 8:16], nodes.index_select(0, senders))
-    torch.testing.assert_close(got[:, 16:], nodes.index_select(0, receivers))
-
-    probe = torch.cos(torch.arange(got.numel(), dtype=got.dtype)).view_as(got)
-    expected = torch.autograd.grad((got * probe).sum(), nodes)[0]
-    handled = boundary.validate_vjp(
-        expected,
-        expected,
-        (edges, nodes, senders, receivers),
-        1,
-        [probe],
-    )
-    assert handled is True
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-def test_edge_gather_pack_triton_forward_and_complete_vjp(dtype) -> None:
-    from orb_models.md_stages.opt4_gather_pack import FastEqEdgeGatherPack
-
-    row_ptr = torch.tensor([0, 3, 5, 9], device="cuda", dtype=torch.int64)
-    candidate = FastEqEdgeGatherPack(row_ptr, max_row=4).cuda()
-    reference = _EdgeGatherPackReference().cuda()
-    senders = torch.tensor(
-        [0, 0, 3, 1, 1, 2, 2, 2, 4], device="cuda", dtype=torch.int64
-    )
-    receivers = torch.tensor(
-        [1, 2, 3, 2, 0, 0, 1, 2, 4], device="cuda", dtype=torch.int64
-    )
-    edges_ref = torch.randn(8, 9, device="cuda", dtype=dtype).T.requires_grad_(True)
-    nodes_ref = torch.randn(8, 35, device="cuda", dtype=dtype).T.requires_grad_(True)
-    edges_got = edges_ref.detach().clone().requires_grad_(True)
-    nodes_got = nodes_ref.detach().clone().requires_grad_(True)
-    expected = reference(edges_ref, nodes_ref, senders, receivers)
-    actual = candidate(edges_got, nodes_got, senders, receivers)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    probe = torch.cos(
-        torch.arange(actual.numel(), device="cuda", dtype=dtype)
-    ).view_as(actual)
-    expected_grads = torch.autograd.grad(
-        (expected * probe).sum(), (edges_ref, nodes_ref)
-    )
-    actual_grads = torch.autograd.grad(
-        (actual * probe).sum(), (edges_got, nodes_got)
-    )
-    torch.testing.assert_close(actual_grads[0], expected_grads[0], rtol=0, atol=0)
-    reference.validate_vjp(
-        actual_grads[1],
-        expected_grads[1],
-        (edges_ref, nodes_ref, senders, receivers),
-        1,
-        [probe],
-    )
+if __name__ == "__main__":
+    unittest.main()
