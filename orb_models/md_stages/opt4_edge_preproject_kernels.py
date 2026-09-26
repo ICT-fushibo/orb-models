@@ -27,18 +27,6 @@ def _gather_silu(PE, PS, PR, S, R, BIAS, Y, Z,
     tl.store(Y + offsets, y, valid)
 
 
-@triton.jit
-def _silu_vjp(Z, G, DZ, E: tl.constexpr, H: tl.constexpr,
-              G0: tl.constexpr, G1: tl.constexpr, BLOCK: tl.constexpr):
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    valid = offsets < E * H
-    z = tl.load(Z + offsets, valid, other=0)
-    g = tl.load(G + offsets // H * G0 + offsets % H * G1, valid, other=0)
-    sigmoid = 1.0 / (1.0 + libdevice.exp(-z))
-    dz = g * (sigmoid * (1.0 + z * (1.0 - sigmoid)))
-    tl.store(DZ + offsets, dz, valid)
-
-
 def gather_silu(pe, ps, pr, senders, receivers, bias):
     output, z = torch.empty_like(pe), torch.empty_like(pe)
     if pe.numel():
@@ -48,12 +36,3 @@ def gather_silu(pe, ps, pr, senders, receivers, bias):
             senders.stride(0), receivers.stride(0), bias.stride(0),
             BLOCK=256, enable_fp_fusion=False)
     return output, z
-
-
-def silu_vjp(z, upstream):
-    grad_z = torch.empty_like(z)
-    if z.numel():
-        _silu_vjp[(triton.cdiv(z.numel(), 256),)](
-            z, upstream, grad_z, *z.shape, *upstream.stride(),
-            BLOCK=256, enable_fp_fusion=False)
-    return grad_z

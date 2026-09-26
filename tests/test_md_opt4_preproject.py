@@ -1,5 +1,6 @@
 """Small standalone contracts for the Opt4 edge-first-linear candidate."""
 import unittest
+from unittest.mock import patch
 import torch
 from orb_models.md_stages.opt4_edge_preproject import (
     EdgeLinearReference, projected_preactivation, linear_vjp, validate_inputs,
@@ -30,6 +31,25 @@ class EdgePreprojectionContracts(unittest.TestCase):
             validate_inputs(n, e, s, s, torch.zeros(4, 5), torch.zeros(4))
         with self.assertRaisesRegex(ValueError, "dtype"):
             validate_inputs(n, e.double(), s, s, torch.zeros(4, 6), torch.zeros(4))
+
+    def test_input_vjp_scatter_occurs_after_full_width_gemm(self):
+        nodes, edges = torch.zeros(3, 2), torch.zeros(5, 2)
+        s, r = torch.tensor([0, 0, 1, 2, 2]), torch.tensor([1, 1, 0, 2, 2])
+        weight, g = torch.randn(4, 6), torch.randn(5, 4)
+        expected = g @ weight
+        seen = []
+        native = torch.Tensor.index_put_
+        def scatter(out, indices, values, *, accumulate):
+            seen.append((tuple(out.shape), values.detach().clone(), accumulate))
+            return native(out, indices, values, accumulate=accumulate)
+        with patch.object(torch.Tensor, "index_put_", scatter), \
+             patch.object(torch.Tensor, "index_add_", side_effect=AssertionError("old hidden-width reduction")):
+            result = linear_vjp(nodes, edges, s, r, weight, g, (True, True, False, False, False, False))
+        self.assertEqual([entry[0] for entry in seen], [(3, 2), (3, 2)])
+        self.assertTrue(all(entry[2] for entry in seen))
+        torch.testing.assert_close(seen[0][1], expected[:, 2:4], rtol=0, atol=0)
+        torch.testing.assert_close(seen[1][1], expected[:, 4:], rtol=0, atol=0)
+        torch.testing.assert_close(result[1], expected[:, :2], rtol=0, atol=0)
 
 
 if __name__ == "__main__":

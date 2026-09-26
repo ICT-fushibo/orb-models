@@ -134,7 +134,8 @@ class _PreprojectRegion(CheckedRegion):
             projection_temporary_bytes=int((e + 2 * n) * h * nodes.element_size()),
             saved_preactivation_bytes=int(e * h * nodes.element_size()),
             forward_projection_multiply_ratio=(e + 2 * n) / (3 * e) if e else None,
-            node_vjp_reduction_width=int(h),
+            node_vjp_reduction_width=int(c),
+            vjp_edge_gradient_bytes=int(e * 3 * c * nodes.element_size()),
         )
         super()._validate(args)
 
@@ -174,9 +175,11 @@ def _install_preproject(model, report):
            "native-gemm-triton-gather-silu-explicit-vjp", modules=modules,
            origin="ORB-specific-linear-distributivity; not a ported FastEq kernel",
            fused_boundaries=["edge-first-linear-node-preprojection", "gather-add-bias-silu"],
-           forward_custom_kernels=1, vjp_custom_kernels=1, forward_native_gemms=3,
+           forward_custom_kernels=1, vjp_custom_kernels=0, forward_native_gemms=3,
+           input_vjp_native_gemms=1,
+           activation_vjp="native-aten-silu-backward-on-saved-preactivation",
            parameter_vjp="explicit-native-GEMM-only-when-requested",
-           node_vjp="native-dynamic-index-add-at-hidden-width",
+           node_vjp="edge-gemm-then-two-native-index-put-branches-at-latent-width",
            weight_layout="checkpoint-strided-views-no-replay-pack",
            unchanged=["attention", "remaining-edge-MLP", "normalization", "node-MLP", "graph-reduction"],
            replay_runtime_compile=False)

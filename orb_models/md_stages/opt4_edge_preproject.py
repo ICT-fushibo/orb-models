@@ -1,7 +1,7 @@
 """ORB inference candidate: hoist repeated node projections out of edge Linear.
 
 No generic GEMM is replaced. Three native GEMMs feed one gather/add/SiLU
-kernel. The explicit first-order VJP uses native dynamic index_add reductions;
+kernel. The explicit first-order VJP keeps native edge-GEMM-then-scatter order;
 it does not assume receivers (or dummy senders) follow fixed CSR rows.
 This is an ORB-specific algebraic experiment, not a ported FastEq kernel.
 """
@@ -47,23 +47,31 @@ def projected_preactivation(nodes, edges, senders, receivers, weight, bias):
 
 
 def linear_vjp(nodes, edges, senders, receivers, weight, grad_z, needs):
-    """Exact chain rule; frozen parameter branches never execute during MD."""
+    """Native-order chain rule, not the reassociated (sum(dz) @ W) formula.
+
+    Algebraically moving a GEMM past scatter changes FP32 rounding substantially
+    for high-degree nodes. Keep ONE edge-wise full-width input-gradient GEMM,
+    then the two independent advanced-index backward branches, as in native
+    cat(edges, nodes[senders], nodes[receivers]) -> Linear.
+    """
     width = nodes.shape[1]
-    we, ws, wr = weight.split(width, dim=1)
     need_nodes, need_edges, _, _, need_weight, need_bias = needs
     dn = de = dw = db = None
-    if need_nodes or need_weight:
-        # Same dynamic reduction semantics as native gather backward. In
-        # particular padding sender indices point to sinks, NOT slot centres.
-        shape = (nodes.shape[0], grad_z.shape[1])
-        gs = grad_z.new_zeros(shape).index_add_(0, senders, grad_z)
-        gr = grad_z.new_zeros(shape).index_add_(0, receivers, grad_z)
+    if need_nodes or need_edges:
+        grad_features = grad_z @ weight
         if need_nodes:
-            dn = gs @ ws + gr @ wr
-        if need_weight:
-            dw = torch.cat((grad_z.T @ edges, gs.T @ nodes, gr.T @ nodes), dim=1)
-    if need_edges:
-        de = grad_z @ we
+            gs, gr = torch.zeros_like(nodes), torch.zeros_like(nodes)
+            gs.index_put_((senders,), grad_features[:, width:2 * width], accumulate=True)
+            gr.index_put_((receivers,), grad_features[:, 2 * width:], accumulate=True)
+            # Do not merge both scatter branches into a single accumulation.
+            dn = gs + gr
+        if need_edges:
+            de = grad_features[:, :width]
+    if need_weight:
+        # Only exhaustive setup/parameter tests use this path, not frozen MD.
+        # Reconstruct linear inputs, not a full reference forward or backward.
+        features = torch.cat((edges, nodes[senders], nodes[receivers]), dim=1)
+        dw = grad_z.T @ features
     if need_bias:
         db = grad_z.sum(0)
     return dn, de, None, None, dw, db
@@ -87,9 +95,10 @@ class _Preproject(torch.autograd.Function):
     @staticmethod
     @once_differentiable
     def backward(ctx, upstream):
-        from .opt4_edge_preproject_kernels import silu_vjp
         nodes, edges, senders, receivers, weight, preactivation = ctx.saved_tensors
-        grad_z = silu_vjp(preactivation, upstream)
+        # Native SiLU backward is already one CUDA kernel. Reuse it with our
+        # saved preactivation; no forward recomputation or exception fallback.
+        grad_z = torch.ops.aten.silu_backward.default(upstream, preactivation)
         return linear_vjp(nodes, edges, senders, receivers, weight, grad_z, ctx.needs_input_grad)
 
 
