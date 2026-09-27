@@ -8,6 +8,17 @@ from orb_models.md_stages.opt4_edge_preproject import (
 
 
 class EdgePreprojectionContracts(unittest.TestCase):
+    def test_parameter_chain_reference_is_independent_of_custom_vjp(self):
+        from orb_models.md_stages.opt4_preproject_validation import parameter_chain_reference
+        n, e, s = torch.zeros(3, 2), torch.zeros(5, 2), torch.zeros(5, dtype=torch.long)
+        args = n, e, s, s, torch.zeros(4, 6), torch.zeros(4)
+        probe = torch.ones(5, 4)
+        with patch("orb_models.md_stages.opt4_edge_preproject.linear_vjp", side_effect=AssertionError("reused VJP")):
+            weight = parameter_chain_reference(args, probe, 2, split_forward=True)
+            bias = parameter_chain_reference(args, probe, 3, split_forward=False)
+        torch.testing.assert_close(weight, torch.zeros(4, 6), rtol=0, atol=0)
+        torch.testing.assert_close(bias, torch.full((4,), 2.5), rtol=0, atol=0)
+
     def test_setup_audit_checks_native_and_candidate(self):
         from orb_models.md_stages.opt4_preproject_validation import validate_preproject_output
         n, e, s = torch.zeros(3, 2), torch.zeros(5, 2), torch.zeros(5, dtype=torch.long)

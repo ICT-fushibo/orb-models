@@ -126,7 +126,14 @@ def install(model, passes, report, options):
 
 class _PreprojectRegion(CheckedRegion):
     def __init__(self, *args, **kwargs):
+        if kwargs.get("vjp_validator") is _preproject_vjp_validator:
+            kwargs["vjp_validator"] = self._validate_vjp
         super().__init__(*args, output_validator=self._validate_output, **kwargs)
+
+    def _validate_vjp(self, actual, expected, args, input_index, probes):
+        audit = {"input_index": input_index}
+        self.detail.setdefault("vjp_validation_audits", []).append(audit)
+        return _preproject_vjp_validator(actual, expected, args, input_index, probes, report=audit)
 
     def _validate_output(self, actual, expected, args, output_index):
         from .opt4_preproject_validation import validate_preproject_output
@@ -149,8 +156,14 @@ class _PreprojectRegion(CheckedRegion):
         super()._validate(args)
 
 
-def _preproject_vjp_validator(actual, expected, _args, _input_index, _output_probes):
-    assert_float32_vjp_reassociation_close(actual, expected, label="ORB first-linear preprojection VJP")
+def _preproject_vjp_validator(actual, expected, args, input_index, output_probes, *, report=None):
+    if input_index in (2, 3):
+        from .opt4_preproject_validation import validate_preproject_parameter_vjp
+        validate_preproject_parameter_vjp(actual, expected, args, input_index, output_probes, report=report)
+    else:
+        metrics = assert_float32_vjp_reassociation_close(actual, expected, label="ORB first-linear preprojection VJP")
+        if report is not None:
+            report.update(status="passed", method="unchanged-node-edge-vjp", **metrics)
     return True
 
 
@@ -190,6 +203,7 @@ def _install_preproject(model, report):
            forward_validation="setup-only-fp64-oracle-and-bounded-reassociation",
            activation_vjp="native-aten-silu-backward-on-saved-preactivation",
            parameter_vjp="explicit-native-GEMM-only-when-requested",
+           parameter_vjp_validation="setup-only-native-and-candidate-same-adjoint-chain",
            node_vjp="edge-gemm-then-two-native-index-put-branches-at-latent-width",
            weight_layout="checkpoint-strided-views-no-replay-pack",
            unchanged=["attention", "remaining-edge-MLP", "normalization", "node-MLP", "graph-reduction"],
