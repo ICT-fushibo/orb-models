@@ -32,6 +32,7 @@ def refresh(model, options) -> None:
             "_opt4_fasteq_edge_epilogue",
             "_opt4_fasteq_node_epilogue",
             "_opt4_edge_preproject",
+            "_opt4_packed_linear",
         ):
             boundary = getattr(module, name, None)
             if isinstance(boundary, CheckedRegion):
@@ -40,6 +41,11 @@ def refresh(model, options) -> None:
 
 def install(model, passes, report, options):
     del options
+    if "orb_edge_mlp_packed_vjp" in passes:
+        if len(passes) != 1:
+            raise FusionSetupError("ORB packed VJP already includes preprojection; select one candidate")
+        from .opt4_edge_packed_vjp import install_packed
+        return install_packed(model, report)
     if "orb_edge_linear_preproject_vjp" in passes:
         if len(passes) != 1:
             raise FusionSetupError("ORB preprojection and RMSNorm are independent, mutually exclusive experiments")
