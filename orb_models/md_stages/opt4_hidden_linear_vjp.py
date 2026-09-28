@@ -94,6 +94,17 @@ class HiddenRegion(CheckedRegion):
         if not self.detail.get("retain_diagnostic_probe"):
             self.tuner.real_probe = None
 
+    def _benchmark(self, args):
+        # CheckedRegion wraps all of _validate in the audit context, including
+        # this benchmark. Its leaves share the real frozen parameters' storage;
+        # use the prepared production pack here, not the setup-only audit path.
+        previous = self.tuner.audit
+        self.tuner.audit = False
+        try:
+            return super()._benchmark(args)
+        finally:
+            self.tuner.audit = previous
+
 
 class HiddenEdgeLinear(nn.Module):
     def __init__(self, original, detail, context):
