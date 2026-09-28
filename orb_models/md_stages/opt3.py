@@ -1621,6 +1621,15 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         shared_evaluator=shared_evaluator,
         initial_positions=state.positions,
     )
+    if request.options.get("opt4_gemm_diagnostic"):
+        if not request.options.get("_opt4_rob1", False):
+            raise ValueError("GEMM diagnostic is Opt4-only; Opt3 remains unchanged")
+        from .opt4_gemm_diagnostic import collect_runner_gemms
+
+        collect_runner_gemms(
+            runner, state.positions, request.options["opt4_gemm_diagnostic"],
+            passes=request.options.get("_opt4_passes", ()),
+        )
     runner.capture(state, integrator)
     initial_state = runner._state_snapshot(state)
     initial_thermostat = runner._thermostat_snapshot(integrator)
