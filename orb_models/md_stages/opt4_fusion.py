@@ -41,11 +41,13 @@ def refresh(model, options) -> None:
 
 def install(model, passes, report, options):
     del options
-    if "orb_edge_mlp_packed_vjp" in passes:
+    from .opt4_first_edge_vjp import PASSES as FIRST_EDGE_PASSES, install_first_edge
+    if set(passes) & FIRST_EDGE_PASSES.keys():
         if len(passes) != 1:
-            raise FusionSetupError("ORB packed VJP already includes preprojection; select one candidate")
-        from .opt4_edge_packed_vjp import install_packed
-        return install_packed(model, report)
+            raise FusionSetupError("select one first-edge layout; it already retains preprojection v1")
+        return install_first_edge(model, passes[0], report)
+    if "orb_edge_mlp_packed_vjp" in passes:
+        raise FusionSetupError("orb_edge_mlp_packed_vjp retired: all-layer packing failed the performance gate")
     if "orb_edge_linear_preproject_vjp" in passes:
         if len(passes) != 1:
             raise FusionSetupError("ORB preprojection and RMSNorm are independent, mutually exclusive experiments")
