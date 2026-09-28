@@ -33,6 +33,7 @@ def refresh(model, options) -> None:
             "_opt4_fasteq_node_epilogue",
             "_opt4_edge_preproject",
             "_opt4_packed_linear",
+            "_opt4_hidden_linear",
         ):
             boundary = getattr(module, name, None)
             if isinstance(boundary, CheckedRegion):
@@ -40,6 +41,11 @@ def refresh(model, options) -> None:
 
 
 def install(model, passes, report, options):
+    if "orb_hidden_linear_vjp_tuned" in passes:
+        if len(passes) != 1:
+            raise FusionSetupError("hidden VJP already retains first-edge packed; select one candidate")
+        from .opt4_hidden_linear_vjp import install_hidden
+        return install_hidden(model, report, options)
     del options
     from .opt4_first_edge_vjp import PASSES as FIRST_EDGE_PASSES, install_first_edge
     if set(passes) & FIRST_EDGE_PASSES.keys():

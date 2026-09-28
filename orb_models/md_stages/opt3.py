@@ -718,6 +718,8 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
 
         # Preserve one released-path reference before replacing the energy/ZBL
         # reductions with real-atom-only variants for sink padding.
+        self._hidden_vjp_enabled = bool(opt4_options and
+            "orb_hidden_linear_vjp_tuned" in opt4_options.get("_opt4_passes", ()))
         if not model_already_prepared:
             (
                 self.reference_initial_forces,
@@ -1350,6 +1352,9 @@ class WholeStepCUDAGraphRunner(OrbTorchSimEvaluator):
     def release(self) -> None:
         self.cuda_graph = None
         self.captured = False
+        if getattr(self, "_hidden_vjp_enabled", False):
+            from .opt4_hidden_linear_vjp import release_hidden
+            release_hidden(self.model.model)
 
     def stats(self) -> dict[str, Any]:
         minimum = int(self.min_real_edges.item()) if self.production_replays else None
@@ -1630,6 +1635,13 @@ def run_md(request: MDRunRequest) -> MDRunResult:
             runner, state.positions, request.options["opt4_gemm_diagnostic"],
             passes=request.options.get("_opt4_passes", ()),
         )
+    if request.options.get("opt4_hidden_vjp_export"):
+        if not runner._hidden_vjp_enabled:
+            raise ValueError("hidden VJP export requires the explicit hidden candidate")
+        from .opt4_hidden_linear_vjp import export_hidden_probes
+        runner(state.positions)  # Actual adjoints / tuning.
+        runner(state.positions)  # Complete region numerical/benchmark audits.
+        export_hidden_probes(runner.model.model, request.options["opt4_hidden_vjp_export"])
     runner.capture(state, integrator)
     initial_state = runner._state_snapshot(state)
     initial_thermostat = runner._thermostat_snapshot(integrator)
